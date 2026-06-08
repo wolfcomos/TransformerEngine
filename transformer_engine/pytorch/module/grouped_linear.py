@@ -243,6 +243,7 @@ class _GroupedLinear(torch.autograd.Function):
 
         split_sizes = m_splits.to(device=device)
         base_split_offsets = tex.splits_to_offsets(split_sizes, 1)
+        x_tensor_offsets = base_split_offsets * in_features
 
         inp_view = inp.reshape(-1, in_features)
         x = cast_if_needed(inp_view, activation_dtype)
@@ -253,7 +254,13 @@ class _GroupedLinear(torch.autograd.Function):
                 columnwise=is_grad_enabled and weight_requires_grad,
             )
             input_quantizer.optimize_for_gemm = True
-            grouped_x = tex.group_quantize(x, input_quantizer, num_gemms, split_sizes)
+            grouped_x = tex.group_quantize(
+                x,
+                input_quantizer,
+                num_gemms,
+                split_sizes,
+                tensor_offsets=x_tensor_offsets,
+            )
         else:
             grouped_x = _GroupedLinear._make_grouped_tensor(
                 x,
@@ -740,6 +747,7 @@ class _GroupedLinear(torch.autograd.Function):
 
         grad_output_view = grad_output.contiguous().view(-1, grad_output.shape[-1])
         dy_2d = cast_if_needed(grad_output_view, ctx.activation_dtype)
+        dy_tensor_offsets = base_split_offsets * ctx.weights_shape_0
         dbias_packed = None
         if ctx.fp8:
             grad_output_quantizer = ctx.grad_output_quantizers[0]
@@ -754,6 +762,7 @@ class _GroupedLinear(torch.autograd.Function):
                     grad_output_quantizer,
                     N,
                     split_sizes,
+                    tensor_offsets=dy_tensor_offsets,
                 )
             else:
                 grouped_dy = tex.group_quantize(
@@ -761,6 +770,7 @@ class _GroupedLinear(torch.autograd.Function):
                     grad_output_quantizer,
                     N,
                     split_sizes,
+                    tensor_offsets=dy_tensor_offsets,
                 )
         else:
             grouped_dy = _GroupedLinear._make_grouped_tensor(

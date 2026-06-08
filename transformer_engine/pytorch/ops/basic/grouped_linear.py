@@ -1214,7 +1214,11 @@ class GroupedLinear(BasicOperation):
         has_bias = self.has_bias
 
         base_split_offsets = tex.splits_to_offsets(split_sizes, 1)
-        split_points = base_split_offsets[1:].to(dtype=torch.int)
+        # `split_points` is unused on this path; keep a placeholder so the
+        # saved-tensor layout stays aligned with other grouped-linear/fused-MLP
+        # contexts.
+        split_points = None
+        x_tensor_offsets = base_split_offsets * self.in_features
 
         # Flatten to 2D so the first dim is the total token count.
         original_shape = list(input_.size())
@@ -1226,7 +1230,13 @@ class GroupedLinear(BasicOperation):
             input_quantizer = input_quantizers[0]
             input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
             input_quantizer.optimize_for_gemm = True
-            grouped_x = tex.group_quantize(x, input_quantizer, num_groups, split_sizes)
+            grouped_x = tex.group_quantize(
+                x,
+                input_quantizer,
+                num_groups,
+                split_sizes,
+                tensor_offsets=x_tensor_offsets,
+            )
         else:
             # No quantize: wrap the contiguous high-precision buffer.
             grouped_x = GroupedTensorStorage(
@@ -1236,7 +1246,7 @@ class GroupedLinear(BasicOperation):
                 quantizer=None,
                 data=x.reshape(-1),
                 first_dims=split_sizes,
-                tensor_offsets=base_split_offsets * self.in_features,
+                tensor_offsets=x_tensor_offsets,
             )
 
         if is_cpu_offload_enabled() and grouped_x is not None:
@@ -1571,6 +1581,7 @@ class GroupedLinear(BasicOperation):
         # to figure out total tokens.
         dy_2d = grad_output.reshape(-1, self.out_features)
         total_tokens = dy_2d.size(0)
+        dy_tensor_offsets = base_split_offsets * self.out_features
 
         # Build the grad_output GroupedTensor.
         # Optionally get dbias is fusion available with bgrad_group_quantize
@@ -1584,11 +1595,19 @@ class GroupedLinear(BasicOperation):
 
             if has_bias and not self._scale_bias:
                 grouped_dy, dbias_packed = tex.bgrad_group_quantize(
-                    dy_2d, grad_output_quantizer, num_groups, split_sizes
+                    dy_2d,
+                    grad_output_quantizer,
+                    num_groups,
+                    split_sizes,
+                    tensor_offsets=dy_tensor_offsets,
                 )
             else:
                 grouped_dy = tex.group_quantize(
-                    dy_2d, grad_output_quantizer, num_groups, split_sizes
+                    dy_2d,
+                    grad_output_quantizer,
+                    num_groups,
+                    split_sizes,
+                    tensor_offsets=dy_tensor_offsets,
                 )
         else:
             dy_2d = maybe_dequantize(dy_2d, dtype)
@@ -1600,7 +1619,7 @@ class GroupedLinear(BasicOperation):
                 quantizer=None,
                 data=dy_2d.reshape(-1),
                 first_dims=split_sizes,
-                tensor_offsets=base_split_offsets * self.out_features,
+                tensor_offsets=dy_tensor_offsets,
             )
 
         # Bias Grads compute if not already computed in bgrad_group_quantize
