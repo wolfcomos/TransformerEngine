@@ -1213,12 +1213,22 @@ class GroupedLinear(BasicOperation):
         num_groups = self.num_groups
         has_bias = self.has_bias
 
-        base_split_offsets = tex.splits_to_offsets(split_sizes, 1)
-        # `split_points` is unused on this path; keep a placeholder so the
-        # saved-tensor layout stays aligned with other grouped-linear/fused-MLP
-        # contexts.
-        split_points = None
-        x_tensor_offsets = base_split_offsets * self.in_features
+        # Prepare grouped split metadata in one fused call.
+        # This mirrors the grouped-MLP optimization from #3075 and avoids
+        # launching extra scalar-multiply kernels for tensor offsets.
+        split_sizes, (
+            split_points,
+            base_split_offsets,
+            x_tensor_offsets,
+            y_tensor_offsets,
+        ) = tex.splits_to_offsets_multi(
+            split_sizes,
+            device,
+            strides=[1, 1, self.in_features, self.out_features],
+            include_leading_zero=[False, True, True, True],
+            dtypes=[torch.int32, torch.int64, torch.int64, torch.int64],
+            bulk_allocate=True,
+        )
 
         # Flatten to 2D so the first dim is the total token count.
         original_shape = list(input_.size())
@@ -1282,7 +1292,7 @@ class GroupedLinear(BasicOperation):
             quantizer=None,
             data=out.reshape(-1),
             first_dims=split_sizes,
-            tensor_offsets=base_split_offsets * self.out_features,
+            tensor_offsets=y_tensor_offsets,
         )
 
         # Bias: hand off to the grouped GEMM (graph-safe, fused). Plain bias
