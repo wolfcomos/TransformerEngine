@@ -205,6 +205,9 @@ class GroupedLinear(BasicOperation):
         # Whether to accumulate weight gradient into main_grad
         self._accumulate_into_main_grad: bool = accumulate_into_main_grad
 
+        self._grouped_x_workspace: Optional[GroupedTensor | GroupedTensorStorage] = None
+        self._grouped_dy_workspace: Optional[GroupedTensor | GroupedTensorStorage] = None
+
         self._apply_delay_wgrad_param_hooks()
 
     def _apply_delay_wgrad_param_hooks(self) -> None:
@@ -233,6 +236,50 @@ class GroupedLinear(BasicOperation):
         """Call all registered wgrad accumulation and reduce hooks."""
         for hook in self.wgrad_accumulation_and_reduce_hooks:
             hook()
+
+    def _clear_grouped_quantize_workspace(self) -> None:
+        self._grouped_x_workspace = None
+        self._grouped_dy_workspace = None
+
+    def _workspace_matches(
+        self,
+        workspace: Optional[GroupedTensor | GroupedTensorStorage],
+        *,
+        shape: tuple[int, int],
+        num_tensors: int,
+        first_dims: Optional[torch.Tensor],
+        tensor_offsets: Optional[torch.Tensor],
+        quantizer: Optional[Quantizer],
+    ) -> bool:
+        def metadata_tensor_matches(
+            cached: Optional[torch.Tensor],
+            current: Optional[torch.Tensor],
+        ) -> bool:
+            if cached is None or current is None:
+                return cached is current
+            return cached is current or cached.data_ptr() == current.data_ptr()
+
+        if workspace is None:
+            return False
+        if tuple(workspace.logical_shape) != shape or workspace.num_tensors != num_tensors:
+            return False
+        if quantizer is None:
+            if workspace.quantizer is not None:
+                return False
+        else:
+            if workspace.quantizer is not quantizer:
+                return False
+            if quantizer.rowwise_usage and (workspace.rowwise_data is None or workspace.scale_inv is None):
+                return False
+            if quantizer.columnwise_usage and (
+                workspace.columnwise_data is None or workspace.columnwise_scale_inv is None
+            ):
+                return False
+        if not metadata_tensor_matches(workspace.first_dims, first_dims):
+            return False
+        if not metadata_tensor_matches(workspace.tensor_offsets, tensor_offsets):
+            return False
+        return True
 
     def need_backward_dw(self) -> bool:
         """Return whether :meth:`backward_dw` must run to finish weight gradients."""
@@ -406,6 +453,7 @@ class GroupedLinear(BasicOperation):
         if self.use_bias and self.single_grouped_bias:
             assert packed_biases is not None
             self._make_grouped_biases_from_packed(packed_biases)
+        self._clear_grouped_quantize_workspace()
         self._apply_delay_wgrad_param_hooks()
 
     def make_grouped_weights(self) -> None:
@@ -668,6 +716,7 @@ class GroupedLinear(BasicOperation):
 
     def reset_recipe_state(self, *, recipe: Optional[Recipe]) -> None:
         super().reset_recipe_state(recipe=recipe)
+        self._clear_grouped_quantize_workspace()
 
         for group_idx in range(self.num_groups):
             # Input/grad output quantizers use internal tensors
@@ -1213,22 +1262,10 @@ class GroupedLinear(BasicOperation):
         num_groups = self.num_groups
         has_bias = self.has_bias
 
-        # Prepare grouped split metadata in one fused call.
-        # This mirrors the grouped-MLP optimization from #3075 and avoids
-        # launching extra scalar-multiply kernels for tensor offsets.
-        split_sizes, (
-            split_points,
-            base_split_offsets,
-            x_tensor_offsets,
-            y_tensor_offsets,
-        ) = tex.splits_to_offsets_multi(
-            split_sizes,
-            device,
-            strides=[1, 1, self.in_features, self.out_features],
-            include_leading_zero=[False, True, True, True],
-            dtypes=[torch.int32, torch.int64, torch.int64, torch.int64],
-            bulk_allocate=True,
-        )
+        base_split_offsets = tex.splits_to_offsets(split_sizes, 1)
+        x_tensor_offsets = base_split_offsets * self.in_features
+        y_tensor_offsets = base_split_offsets * self.out_features
+        split_points = None
 
         # Flatten to 2D so the first dim is the total token count.
         original_shape = list(input_.size())
@@ -1240,13 +1277,37 @@ class GroupedLinear(BasicOperation):
             input_quantizer = input_quantizers[0]
             input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
             input_quantizer.optimize_for_gemm = True
+            can_reuse_grouped_x = with_quantized_compute and not weight_requires_grad
+            grouped_x_workspace = None
+            if can_reuse_grouped_x:
+                grouped_x_workspace = self._grouped_x_workspace
+                grouped_x_workspace_offsets = (
+                    grouped_x_workspace.tensor_offsets if grouped_x_workspace is not None else x_tensor_offsets
+                )
+                if not self._workspace_matches(
+                    grouped_x_workspace,
+                    shape=(total_tokens, self.in_features),
+                    num_tensors=num_groups,
+                    first_dims=split_sizes,
+                    tensor_offsets=grouped_x_workspace_offsets,
+                    quantizer=input_quantizer,
+                ):
+                    grouped_x_workspace = None
+            grouped_x_first_dims = split_sizes
+            grouped_x_tensor_offsets = x_tensor_offsets
+            if grouped_x_workspace is not None:
+                grouped_x_first_dims = grouped_x_workspace.first_dims
+                grouped_x_tensor_offsets = grouped_x_workspace.tensor_offsets
             grouped_x = tex.group_quantize(
                 x,
                 input_quantizer,
                 num_groups,
-                split_sizes,
-                tensor_offsets=x_tensor_offsets,
+                grouped_x_first_dims,
+                tensor_offsets=grouped_x_tensor_offsets,
+                output=grouped_x_workspace,
             )
+            if can_reuse_grouped_x and grouped_x_workspace is None:
+                self._grouped_x_workspace = grouped_x
         else:
             # No quantize: wrap the contiguous high-precision buffer.
             grouped_x = GroupedTensorStorage(
@@ -1592,6 +1653,11 @@ class GroupedLinear(BasicOperation):
         dy_2d = grad_output.reshape(-1, self.out_features)
         total_tokens = dy_2d.size(0)
         dy_tensor_offsets = base_split_offsets * self.out_features
+        delay_wgrad = (
+            ctx.weight_requires_grad
+            and self.wgrad_store is not None
+            and self.wgrad_store.delay_wgrad_compute()
+        )
 
         # Build the grad_output GroupedTensor.
         # Optionally get dbias is fusion available with bgrad_group_quantize
@@ -1602,23 +1668,50 @@ class GroupedLinear(BasicOperation):
                 rowwise=ctx.input_requires_grad, columnwise=ctx.weight_requires_grad
             )
             grad_output_quantizer.optimize_for_gemm = True
+            can_reuse_grouped_dy = with_quantized_compute and not delay_wgrad
+            grouped_dy_workspace = None
+            if can_reuse_grouped_dy:
+                grouped_dy_workspace = self._grouped_dy_workspace
+                grouped_dy_workspace_offsets = (
+                    grouped_dy_workspace.tensor_offsets
+                    if grouped_dy_workspace is not None
+                    else dy_tensor_offsets
+                )
+                if not self._workspace_matches(
+                    grouped_dy_workspace,
+                    shape=(total_tokens, self.out_features),
+                    num_tensors=num_groups,
+                    first_dims=split_sizes,
+                    tensor_offsets=grouped_dy_workspace_offsets,
+                    quantizer=grad_output_quantizer,
+                ):
+                    grouped_dy_workspace = None
+            grouped_dy_first_dims = split_sizes
+            grouped_dy_tensor_offsets = dy_tensor_offsets
+            if grouped_dy_workspace is not None:
+                grouped_dy_first_dims = grouped_dy_workspace.first_dims
+                grouped_dy_tensor_offsets = grouped_dy_workspace.tensor_offsets
 
             if has_bias and not self._scale_bias:
                 grouped_dy, dbias_packed = tex.bgrad_group_quantize(
                     dy_2d,
                     grad_output_quantizer,
                     num_groups,
-                    split_sizes,
-                    tensor_offsets=dy_tensor_offsets,
+                    grouped_dy_first_dims,
+                    tensor_offsets=grouped_dy_tensor_offsets,
+                    output=grouped_dy_workspace,
                 )
             else:
                 grouped_dy = tex.group_quantize(
                     dy_2d,
                     grad_output_quantizer,
                     num_groups,
-                    split_sizes,
-                    tensor_offsets=dy_tensor_offsets,
+                    grouped_dy_first_dims,
+                    tensor_offsets=grouped_dy_tensor_offsets,
+                    output=grouped_dy_workspace,
                 )
+            if can_reuse_grouped_dy and grouped_dy_workspace is None:
+                self._grouped_dy_workspace = grouped_dy
         else:
             dy_2d = maybe_dequantize(dy_2d, dtype)
             # Wrap BF16/FP16 buffer as a GroupedTensor for grouped gemm
@@ -1727,11 +1820,6 @@ class GroupedLinear(BasicOperation):
                 wgrad_output = final_weight_grads
 
         # wgrad GEMM
-        delay_wgrad = (
-            ctx.weight_requires_grad
-            and self.wgrad_store is not None
-            and self.wgrad_store.delay_wgrad_compute()
-        )
         if ctx.weight_requires_grad:
             wgrad_gemm = functools.partial(
                 general_grouped_gemm_for_grouped_tensor,

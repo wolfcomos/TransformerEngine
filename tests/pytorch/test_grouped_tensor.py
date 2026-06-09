@@ -559,6 +559,71 @@ class TestGroupedTensor:
         assert torch.equal(grouped_output.scale_inv, expected_output.scale_inv)
 
     @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_group_quantize_reuses_output_mxfp8(self) -> None:
+        num_tensors = 4
+        hidden = 128
+        splits = torch.tensor([128, 256, 128, 256], dtype=torch.int64, device="cuda")
+        x = torch.randn(int(splits.sum()), hidden, dtype=torch.bfloat16, device="cuda")
+        offsets = tex.splits_to_offsets(splits, hidden)
+
+        quantizer = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3)
+        quantizer.internal = True
+        quantizer.set_usage(rowwise=True, columnwise=True)
+
+        out = tex.group_quantize(x, quantizer, num_tensors, splits, tensor_offsets=offsets)
+        row_ptr = out.rowwise_data.data_ptr()
+        col_ptr = out.columnwise_data.data_ptr()
+
+        x2 = torch.randn_like(x)
+        out2 = tex.group_quantize(
+            x2,
+            quantizer,
+            num_tensors,
+            splits,
+            tensor_offsets=offsets,
+            output=out,
+        )
+
+        assert out2 is out
+        assert out2.rowwise_data.data_ptr() == row_ptr
+        assert out2.columnwise_data.data_ptr() == col_ptr
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_bgrad_group_quantize_reuses_output_mxfp8(self) -> None:
+        num_tensors = 4
+        hidden = 128
+        splits = torch.tensor([128, 256, 128, 256], dtype=torch.int64, device="cuda")
+        dy = torch.randn(int(splits.sum()), hidden, dtype=torch.bfloat16, device="cuda")
+        offsets = tex.splits_to_offsets(splits, hidden)
+
+        quantizer = MXFP8Quantizer(fp8_dtype=te.DType.kFloat8E4M3)
+        quantizer.internal = True
+        quantizer.set_usage(rowwise=True, columnwise=True)
+
+        out, dbias = tex.bgrad_group_quantize(
+            dy,
+            quantizer,
+            num_tensors,
+            splits,
+            tensor_offsets=offsets,
+        )
+        row_ptr = out.rowwise_data.data_ptr()
+
+        dy2 = torch.randn_like(dy)
+        out2, dbias2 = tex.bgrad_group_quantize(
+            dy2,
+            quantizer,
+            num_tensors,
+            splits,
+            tensor_offsets=offsets,
+            output=out,
+        )
+
+        assert out2 is out
+        assert out2.rowwise_data.data_ptr() == row_ptr
+        assert dbias2.shape == dbias.shape
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
     def test_bgrad_group_quantize_zero_size_tensor(self) -> None:
         """Test bgrad_group_quantize handles zero-row input without error."""
         num_tensors = 3

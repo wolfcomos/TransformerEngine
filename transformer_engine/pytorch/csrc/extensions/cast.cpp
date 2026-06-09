@@ -138,6 +138,57 @@ py::object create_empty_quantized_tensor(py::handle quantizer, const std::vector
 
 namespace {
 
+void validate_grouped_quantize_output(py::handle output, const Quantizer *quantizer_cpp,
+                                      size_t num_tensors,
+                                      const std::vector<size_t> &logical_shape,
+                                      const std::optional<at::Tensor> &first_dims,
+                                      const std::optional<at::Tensor> &tensor_offsets) {
+  using namespace transformer_engine::pytorch::detail;
+  NVTE_CHECK(IsGroupedTensor(output.ptr()) || IsGroupedTensorStorage(output.ptr()),
+             "group_quantize output must be a GroupedTensor or GroupedTensorStorage.");
+  NVTE_CHECK(output.attr("num_tensors").cast<size_t>() == num_tensors,
+             "group_quantize output has wrong num_tensors.");
+  NVTE_CHECK(output.attr("logical_shape").cast<std::vector<size_t>>() == logical_shape,
+             "group_quantize output has wrong logical_shape.");
+  NVTE_CHECK(!output.attr("quantizer").is_none(),
+             "group_quantize output must be quantized.");
+  NVTE_CHECK(output.attr("quantizer").ptr() == quantizer_cpp->quantizer.ptr(),
+             "group_quantize output quantizer must match provided quantizer.");
+
+  if (quantizer_cpp->rowwise_usage) {
+    NVTE_CHECK(!output.attr("rowwise_data").is_none(),
+               "group_quantize output is missing rowwise_data.");
+    NVTE_CHECK(!output.attr("scale_inv").is_none(),
+               "group_quantize output is missing scale_inv.");
+  }
+  if (quantizer_cpp->columnwise_usage) {
+    NVTE_CHECK(!output.attr("columnwise_data").is_none(),
+               "group_quantize output is missing columnwise_data.");
+    NVTE_CHECK(!output.attr("columnwise_scale_inv").is_none(),
+               "group_quantize output is missing columnwise_scale_inv.");
+  }
+
+  auto validate_metadata_tensor = [&output](const char *name, const at::Tensor &expected) {
+    auto output_attr = output.attr(name);
+    NVTE_CHECK(!output_attr.is_none(), "group_quantize output is missing ", name, ".");
+    const auto output_tensor = output_attr.cast<at::Tensor>();
+    const bool same_metadata = output_tensor.scalar_type() == expected.scalar_type() &&
+                               output_tensor.device() == expected.device() &&
+                               output_tensor.sizes() == expected.sizes();
+    NVTE_CHECK(same_metadata, "group_quantize output ", name, " has wrong metadata.");
+    const bool same_pointer = output_tensor.data_ptr() == expected.data_ptr();
+    const bool same_values = same_pointer || at::equal(output_tensor, expected);
+    NVTE_CHECK(same_values,
+               "group_quantize output ", name, " does not match provided ", name, ".");
+  };
+  if (first_dims.has_value()) {
+    validate_metadata_tensor("first_dims", *first_dims);
+  }
+  if (tensor_offsets.has_value()) {
+    validate_metadata_tensor("tensor_offsets", *tensor_offsets);
+  }
+}
+
 // helper functions for NVFP4 grouped quantization (cuda graph safe with shapes stored in device without D2H copy)
 void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
                                GroupedTensorWrapper &grouped_output_tensor,
@@ -209,7 +260,7 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
 // NOTE: Only supports varying first dim.
 py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const size_t num_tensors,
                           std::optional<at::Tensor> first_dims,
-                          std::optional<at::Tensor> tensor_offsets) {
+                          std::optional<at::Tensor> tensor_offsets, py::object output) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
 
@@ -232,10 +283,19 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
       tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
 
   // Create output GroupedTensor.
-  auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
-      num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
-      py::reinterpret_borrow<py::object>(quantizer), first_dims, tensor_offsets, logical_first_dim,
-      logical_last_dim);
+  auto grouped_output = [&]() -> std::pair<GroupedTensorWrapper, py::object> {
+    if (output.is_none()) {
+      return quantizer_cpp->create_grouped_tensor(
+          num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
+          py::reinterpret_borrow<py::object>(quantizer), first_dims, tensor_offsets,
+          logical_first_dim, logical_last_dim);
+    }
+    validate_grouped_quantize_output(output, quantizer_cpp.get(), num_tensors, logical_shape,
+                                     first_dims, tensor_offsets);
+    return std::make_pair(detail::GroupedTensorFromPyTorchGroupedTensor(output), output);
+  }();
+  auto &grouped_output_tensor_cpp = grouped_output.first;
+  auto grouped_output_py = grouped_output.second;
 
   // dispatch to scaling methods
   enum class GroupedQuantizationMode {
@@ -358,7 +418,7 @@ py::object nvfp4_group_quantize_with_amax(const at::Tensor &tensor, py::handle q
 
 py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
                                 const size_t num_tensors, std::optional<at::Tensor> first_dims,
-                                std::optional<at::Tensor> tensor_offsets) {
+                                std::optional<at::Tensor> tensor_offsets, py::object output) {
   using namespace transformer_engine::pytorch::detail;
   init_extension();
 
@@ -382,10 +442,19 @@ py::object bgrad_group_quantize(const at::Tensor &tensor, py::handle quantizer,
   grouped_input_tensor.set_rowwise_data(
       tensor.data_ptr(), GetTransformerEngineDType(tensor.scalar_type()), getTensorShape(tensor));
 
-  auto [grouped_output_tensor_cpp, grouped_output_py] = quantizer_cpp->create_grouped_tensor(
-      num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
-      py::reinterpret_borrow<py::object>(quantizer), first_dims, tensor_offsets, logical_first_dim,
-      logical_last_dim);
+  auto grouped_output = [&]() -> std::pair<GroupedTensorWrapper, py::object> {
+    if (output.is_none()) {
+      return quantizer_cpp->create_grouped_tensor(
+          num_tensors, logical_shape, GetTransformerEngineDType(tensor.scalar_type()),
+          py::reinterpret_borrow<py::object>(quantizer), first_dims, tensor_offsets,
+          logical_first_dim, logical_last_dim);
+    }
+    validate_grouped_quantize_output(output, quantizer_cpp.get(), num_tensors, logical_shape,
+                                     first_dims, tensor_offsets);
+    return std::make_pair(detail::GroupedTensorFromPyTorchGroupedTensor(output), output);
+  }();
+  auto &grouped_output_tensor_cpp = grouped_output.first;
+  auto grouped_output_py = grouped_output.second;
 
   if (empty_input_buffer) {
     at::Tensor dbias_torch =

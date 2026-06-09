@@ -81,6 +81,12 @@ inline bool IsNVFP4Tensor(PyObject *obj) {
   return Py_TYPE(obj) == NVFP4TensorPythonClass || Py_TYPE(obj) == NVFP4TensorStoragePythonClass;
 }
 
+inline bool IsGroupedTensor(PyObject *obj) { return Py_TYPE(obj) == GroupedTensorPythonClass; }
+
+inline bool IsGroupedTensorStorage(PyObject *obj) {
+  return Py_TYPE(obj) == GroupedTensorStoragePythonClass;
+}
+
 TensorWrapper NVTETensorFromFloat8Tensor(py::handle tensor, Quantizer *quantizer);
 
 template <typename T>
