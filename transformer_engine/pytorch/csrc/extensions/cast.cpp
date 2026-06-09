@@ -5,6 +5,7 @@
  ************************************************************************/
 
 #include "transformer_engine/cast.h"
+#include "transformer_engine/activation.h"
 
 #include <algorithm>
 #include <cstdint>
@@ -204,6 +205,35 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
   });
 }
 
+TensorWrapper make_tensor_view_for_grouped_mxfp8_output(
+    const GroupedTensorWrapper &grouped_output, const MXFP8Quantizer *quantizer_cpp, size_t rows,
+    size_t cols) {
+  TensorWrapper output_cpp(NVTE_MXFP8_1D_SCALING);
+  const std::vector<size_t> output_shape = {rows, cols};
+
+  if (grouped_output.get_rowwise_data().data_ptr != nullptr) {
+    output_cpp.set_rowwise_data(grouped_output.get_rowwise_data().data_ptr, quantizer_cpp->dtype,
+                                output_shape);
+  }
+  if (grouped_output.get_columnwise_data().data_ptr != nullptr) {
+    output_cpp.set_columnwise_data(grouped_output.get_columnwise_data().data_ptr,
+                                   quantizer_cpp->dtype, output_shape);
+  }
+  if (grouped_output.get_rowwise_scale_inv().data_ptr != nullptr) {
+    output_cpp.set_rowwise_scale_inv(grouped_output.get_rowwise_scale_inv().data_ptr,
+                                     DType::kFloat8E8M0,
+                                     quantizer_cpp->get_scale_shape(output_shape, false));
+  }
+  if (grouped_output.get_columnwise_scale_inv().data_ptr != nullptr) {
+    output_cpp.set_columnwise_scale_inv(grouped_output.get_columnwise_scale_inv().data_ptr,
+                                        DType::kFloat8E8M0,
+                                        quantizer_cpp->get_scale_shape(output_shape, true));
+  }
+  output_cpp.set_with_gemm_swizzled_scales(grouped_output.get_with_gemm_swizzled_scales());
+  quantizer_cpp->set_quantization_params(&output_cpp);
+  return output_cpp;
+}
+
 }  // namespace
 
 // NOTE: Only supports varying first dim.
@@ -281,6 +311,74 @@ py::object group_quantize(const at::Tensor &tensor, py::handle quantizer, const 
   }
 
   return py::reinterpret_borrow<py::object>(grouped_output_py);
+}
+
+py::object grouped_swiglu_quantize(const at::Tensor &tensor, py::handle quantizer,
+                                   const size_t num_tensors, std::optional<at::Tensor> first_dims,
+                                   std::optional<at::Tensor> tensor_offsets,
+                                   const py::object &output) {
+  using namespace transformer_engine::pytorch::detail;
+  init_extension();
+
+  NVTE_CHECK(tensor.dim() == 2, "Tensor must be 2D");
+  NVTE_CHECK(detail::IsMXFP8Quantizers(quantizer.ptr()),
+             "grouped_swiglu_quantize: only MXFP8 quantizer is supported.");
+
+  std::vector<size_t> logical_shape;
+  for (const auto &d : tensor.sizes()) {
+    logical_shape.push_back(d);
+  }
+  const auto logical_first_dim = logical_shape[0];
+  const auto logical_last_dim = logical_shape[1];
+  NVTE_CHECK(logical_last_dim % 2 == 0,
+             "grouped_swiglu_quantize expects an even last dimension, got ", logical_last_dim, ".");
+  const auto output_last_dim = logical_last_dim / 2;
+
+  auto quantizer_cpp = convert_quantizer(quantizer);
+  auto *mxfp8_quantizer_cpp = dynamic_cast<MXFP8Quantizer *>(quantizer_cpp.get());
+  NVTE_CHECK(mxfp8_quantizer_cpp != nullptr,
+             "grouped_swiglu_quantize: failed to cast quantizer to MXFP8Quantizer.");
+
+  std::optional<GroupedTensorWrapper> grouped_output_tensor_cpp = std::nullopt;
+  py::object grouped_output_py;
+  const std::vector<size_t> output_shape = {logical_first_dim, output_last_dim};
+  if (output.is_none()) {
+    auto grouped_output = quantizer_cpp->create_grouped_tensor(
+        num_tensors, output_shape, GetTransformerEngineDType(tensor.scalar_type()),
+        py::reinterpret_borrow<py::object>(quantizer), first_dims, tensor_offsets, logical_first_dim,
+        output_last_dim);
+    grouped_output_tensor_cpp.emplace(std::move(grouped_output.first));
+    grouped_output_py = std::move(grouped_output.second);
+  } else {
+    grouped_output_py = py::reinterpret_borrow<py::object>(output);
+    const auto output_shape_py = grouped_output_py.attr("logical_shape").cast<std::vector<size_t>>();
+    NVTE_CHECK(output_shape_py.size() == 2,
+               "grouped_swiglu_quantize output logical_shape must be rank-2.");
+    NVTE_CHECK(output_shape_py[0] == logical_first_dim && output_shape_py[1] == output_last_dim,
+               "grouped_swiglu_quantize output logical_shape mismatch. Expected [",
+               logical_first_dim, ", ", output_last_dim, "], got [", output_shape_py[0], ", ",
+               output_shape_py[1], "].");
+    NVTE_CHECK(grouped_output_py.attr("num_tensors").cast<size_t>() == num_tensors,
+               "grouped_swiglu_quantize output num_tensors mismatch.");
+    auto output_quantizer = grouped_output_py.attr("quantizer");
+    NVTE_CHECK(!output_quantizer.is_none() && detail::IsMXFP8Quantizers(output_quantizer.ptr()),
+               "grouped_swiglu_quantize output must be backed by an MXFP8 quantizer.");
+    grouped_output_tensor_cpp = GroupedTensorFromPyTorchGroupedTensor(grouped_output_py);
+  }
+
+  if (logical_first_dim == 0 || output_last_dim == 0) {
+    return grouped_output_py;
+  }
+
+  auto input_contiguous = tensor.contiguous();
+  const TensorWrapper &input_nvte = makeTransformerEngineTensor(input_contiguous);
+  TensorWrapper output_nvte = make_tensor_view_for_grouped_mxfp8_output(
+      *grouped_output_tensor_cpp, mxfp8_quantizer_cpp, logical_first_dim, output_last_dim);
+
+  NVTE_SCOPED_GIL_RELEASE({
+    nvte_swiglu(input_nvte.data(), output_nvte.data(), at::cuda::getCurrentCUDAStream());
+  });
+  return grouped_output_py;
 }
 
 py::object nvfp4_group_quantize_with_amax(const at::Tensor &tensor, py::handle quantizer,

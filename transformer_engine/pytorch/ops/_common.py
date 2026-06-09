@@ -21,6 +21,7 @@ from ..quantization import FP8GlobalStateManager
 from ..tensor import NVFP4Quantizer, NVFP4Tensor, NVFP4TensorStorage, Quantizer
 from ..tensor.float8_tensor import Float8Tensor
 from ..tensor.grouped_tensor import GroupedTensor
+from ..tensor.storage.grouped_tensor_storage import GroupedTensorStorage
 from ..quantized_tensor import QuantizedTensorStorage
 from ..utils import canonicalize_dtype
 
@@ -146,6 +147,26 @@ def _group_quantize_for_grouped_mlp(
         quantizer,
         split_sizes,
         tensor_offsets=tensor_offsets,
+    )
+
+
+def _grouped_swiglu_quantize_for_grouped_linear(
+    tensor: torch.Tensor,
+    quantizer: Quantizer,
+    num_groups: int,
+    split_sizes: torch.Tensor,
+    *,
+    tensor_offsets: Optional[torch.Tensor] = None,
+    output: Optional[GroupedTensorStorage] = None,
+) -> GroupedTensorStorage:
+    """Run grouped SwiGLU with direct grouped quantized output."""
+    return tex.grouped_swiglu_quantize(
+        tensor,
+        quantizer,
+        num_groups,
+        split_sizes,
+        tensor_offsets=tensor_offsets,
+        output=output,
     )
 
 
