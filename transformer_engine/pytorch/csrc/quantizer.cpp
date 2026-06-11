@@ -1987,6 +1987,7 @@ std::pair<GroupedTensorWrapper, py::object> NVFP4Quantizer::create_grouped_tenso
   const bool row_scaled_nvfp4 = this->row_scaled_nvfp4;
   const bool nvfp4_use_4over6 = this->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
   const int nvfp4_e4m3_max = this->nvfp4_e4m3_max;
+  const bool with_gemm_swizzled_scales = this->optimize_for_gemm && !row_scaled_nvfp4;
   if (row_scaled_nvfp4) {
     NVTE_CHECK(rowwise_usage, "Row-scaled NVFP4 grouped quantization requires rowwise usage.");
     NVTE_CHECK(!columnwise_usage,
@@ -2036,7 +2037,7 @@ std::pair<GroupedTensorWrapper, py::object> NVFP4Quantizer::create_grouped_tenso
                                getTensorShape(*tensor_offsets));
   }
 
-  out_cpp.set_with_gemm_swizzled_scales(this->optimize_for_gemm);
+  out_cpp.set_with_gemm_swizzled_scales(with_gemm_swizzled_scales);
 
   py::handle GroupedTensorClass = grouped_tensor_python_class(this->internal);
   py::dict kwargs;
@@ -2059,7 +2060,7 @@ std::pair<GroupedTensorWrapper, py::object> NVFP4Quantizer::create_grouped_tenso
   kwargs["first_dims"] = first_dims.has_value() ? py::cast(*first_dims) : py::none();
   kwargs["last_dims"] = py::none();
   kwargs["tensor_offsets"] = tensor_offsets.has_value() ? py::cast(*tensor_offsets) : py::none();
-  kwargs["with_gemm_swizzled_scales"] = this->optimize_for_gemm;
+  kwargs["with_gemm_swizzled_scales"] = with_gemm_swizzled_scales;
   kwargs["row_scaled_nvfp4"] = py::cast(row_scaled_nvfp4);
   kwargs["nvfp4_use_4over6"] = py::cast(nvfp4_use_4over6);
   kwargs["nvfp4_e4m3_max"] = py::cast(nvfp4_e4m3_max);
