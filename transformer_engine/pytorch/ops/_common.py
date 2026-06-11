@@ -159,7 +159,13 @@ def _grouped_swiglu_quantize_for_grouped_linear(
     tensor_offsets: Optional[torch.Tensor] = None,
     output: Optional[GroupedTensorStorage] = None,
 ) -> GroupedTensorStorage:
-    """Run grouped SwiGLU with direct grouped quantized output."""
+    """Run grouped SwiGLU with direct grouped quantized output.
+
+    MXFP8 only. Requires each group's token count (``split_sizes``) to be
+    divisible by 128, which is enforced device-side by the grouped MXFP8
+    kernels. Within that constraint the result is bitwise-identical to
+    ``swiglu`` followed by ``group_quantize``.
+    """
     return tex.grouped_swiglu_quantize(
         tensor,
         quantizer,

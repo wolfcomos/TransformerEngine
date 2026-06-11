@@ -375,6 +375,16 @@ py::object grouped_swiglu_quantize(const at::Tensor &tensor, py::handle quantize
   TensorWrapper output_nvte = make_tensor_view_for_grouped_mxfp8_output(
       *grouped_output_tensor_cpp, mxfp8_quantizer_cpp, logical_first_dim, output_last_dim);
 
+  // Precondition: each group's first dim must be divisible by 128. This is
+  // enforced device-side by the grouped MXFP8 kernels (and by the grouped GEMM
+  // that consumes this output); it is intentionally not checked here because
+  // `first_dims` lives on device and a host-side per-group check would require a
+  // D2H copy that breaks CUDA-graph safety (matching `group_quantize`).
+  //
+  // Under that invariant the 1x32 rowwise and 32x1 columnwise MXFP8 scaling
+  // blocks -- and the 128-row GEMM-swizzle tiles -- never straddle a group
+  // boundary, so this single flat SwiGLU+quantize over the concatenated buffer
+  // is bitwise-identical to a per-group SwiGLU+quantize.
   NVTE_SCOPED_GIL_RELEASE({
     nvte_swiglu(input_nvte.data(), output_nvte.data(), at::cuda::getCurrentCUDAStream());
   });
