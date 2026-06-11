@@ -33,6 +33,63 @@ from nvfp4_utils import (
 recipe_available, reason_for_no_recipe = te.is_nvfp4_available(return_reason=True)
 
 
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("use_4over6", [False, True], ids=["nvfp4", "4over6"])
+def test_row_scaled_group_quantize_matches_flat_quantize(use_4over6: bool) -> None:
+    """Grouped row-scaled NVFP4 should reuse the flat Tensor quant/dequant path."""
+
+    device = "cuda"
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    M, N = 256, 512
+    num_tensors = 2
+    split_sections = torch.tensor([128, 128], dtype=torch.int64, device=device)
+    x = torch.randn((M, N), dtype=torch.bfloat16, device=device)
+
+    quantizer = NVFP4Quantizer(
+        fp4_dtype=te.DType.kFloat4E2M1,
+        rowwise=True,
+        columnwise=False,
+        with_amax_reduction=False,
+        amax_reduction_group=None,
+        with_rht=False,
+        with_post_rht_amax=False,
+        with_2d_quantization=False,
+        stochastic_rounding=False,
+        row_scaled_nvfp4=True,
+        nvfp4_use_4over6=use_4over6,
+        nvfp4_e4m3_max=256 if use_4over6 else 448,
+        nvfp4_4over6_err_mode="MAE",
+    )
+
+    grouped = tex.group_quantize(x, quantizer, num_tensors, split_sections)
+    flat = quantizer(x)
+
+    torch.testing.assert_close(
+        grouped.rowwise_data,
+        flat._rowwise_data.view(dtype=torch.uint8).reshape(-1),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(
+        grouped.scale_inv,
+        flat._rowwise_scale_inv.reshape(-1),
+        atol=0,
+        rtol=0,
+    )
+    torch.testing.assert_close(grouped.amax, flat._amax_rowwise, atol=0, rtol=0)
+
+    grouped_dequantized = tex.group_dequantize(grouped, te.DType.kBFloat16)
+    flat_dequantized = tex.dequantize(flat, te.DType.kBFloat16)
+    torch.testing.assert_close(
+        grouped_dequantized.rowwise_data.reshape(M, N),
+        flat_dequantized,
+        atol=0,
+        rtol=0,
+    )
+
+
 def check_group_quantization_nvfp4_versus_reference(
     x_dtype: torch.dtype,
     M: int,
