@@ -11,6 +11,7 @@ from .backward_linear_add import BackwardLinearAdd
 from .backward_linear_scale import BackwardLinearScale
 from .forward_linear_bias_activation import ForwardLinearBiasActivation
 from .forward_linear_bias_add import ForwardLinearBiasAdd
+from .forward_grouped_swiglu_grouped_linear import ForwardGroupedSwiGLUGroupedLinear
 from .forward_linear_scale_add import ForwardLinearScaleAdd
 from .userbuffers_backward_linear import UserbuffersBackwardLinear
 from .userbuffers_forward_linear import UserbuffersForwardLinear
@@ -20,6 +21,7 @@ from .userbuffers_forward_linear import UserbuffersForwardLinear
 register_forward_fusion(UserbuffersForwardLinear.fuse_forward_ops)
 register_forward_fusion(ForwardLinearBiasAdd.fuse_forward_ops)
 register_forward_fusion(ForwardLinearBiasActivation.fuse_forward_ops)
+register_forward_fusion(ForwardGroupedSwiGLUGroupedLinear.fuse_forward_ops)
 register_forward_fusion(ForwardLinearScaleAdd.fuse_forward_ops)
 
 # Register backward fusions

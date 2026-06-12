@@ -11,6 +11,7 @@ import os
 import math
 import random
 from typing import Optional
+from unittest import mock
 
 import pytest
 
@@ -4142,6 +4143,362 @@ class TestSequentialModules:
         elif single_grouped_weight:
             assert_close(fc1.weight.grad, fc1_w_ref_grad, **tols)
             assert_close(fc2.weight.grad, fc2_w_ref_grad, **tols)
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_grouped_linear_swiglu_grouped_linear_skips_activation_quantizer(
+        self,
+        *,
+        device: torch.device = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        group_size: int = 4,
+        hidden_size: int = 128,
+        split_alignment: int = 128,
+    ) -> None:
+        """Unfused GroupedLinear->SwiGLU->GroupedLinear should not quantize at activation output."""
+        recipe = make_recipe("mxfp8")
+        split_sizes = torch.tensor([split_alignment] * group_size, dtype=torch.int64, device=device)
+        in_shape = (split_sizes.sum().item(), hidden_size)
+        x = torch.empty(in_shape, device=device, dtype=dtype).uniform_(-0.25, 0.25)
+        captured_next_quantizers = []
+
+        original_op_forward = te_ops.SwiGLU.op_forward
+
+        def _wrapped_op_forward(
+            self,
+            ctx,
+            input_,
+            prev_op_grad_output_quantizer,
+            next_op_input_quantizer,
+        ):
+            captured_next_quantizers.append(next_op_input_quantizer)
+            return original_op_forward(
+                self,
+                ctx,
+                input_,
+                prev_op_grad_output_quantizer,
+                next_op_input_quantizer,
+            )
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "NVTE_CUTEDSL_FUSED_GROUPED_MLP": "0",
+                "NVTE_GROUPED_SWIGLU_GROUPED_LINEAR_FUSION": "0",
+            },
+        ):
+            with mock.patch.object(te_ops.SwiGLU, "op_forward", new=_wrapped_op_forward):
+                with te.quantized_model_init(enabled=True, recipe=recipe):
+                    module = te_ops.Sequential(
+                        te_ops.GroupedLinear(
+                            group_size,
+                            hidden_size,
+                            2 * hidden_size,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        ),
+                        te_ops.SwiGLU(),
+                        te_ops.GroupedLinear(
+                            group_size,
+                            hidden_size,
+                            hidden_size,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        ),
+                    )
+
+                with te.autocast(enabled=True, recipe=recipe):
+                    _ = module(x, split_sizes, split_sizes)
+
+        forward_ops = module._module_groups[0]._forward_ops
+        assert [type(op).__name__ for op, _ in forward_ops] == [
+            "GroupedLinear",
+            "SwiGLU",
+            "GroupedLinear",
+        ]
+        assert captured_next_quantizers
+        assert all(q is None for q in captured_next_quantizers)
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_grouped_linear_swiglu_grouped_linear_uses_grouped_swiglu_fusion(
+        self,
+        *,
+        device: torch.device = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        group_size: int = 4,
+        hidden_size: int = 128,
+        split_alignment: int = 128,
+    ) -> None:
+        """Fallback fusion should replace SwiGLU->GroupedLinear with grouped_swiglu path."""
+        recipe = make_recipe("mxfp8")
+        split_sizes = torch.tensor([split_alignment] * group_size, dtype=torch.int64, device=device)
+        in_shape = (split_sizes.sum().item(), hidden_size)
+        x = torch.empty(in_shape, device=device, dtype=dtype).uniform_(-0.25, 0.25)
+
+        with mock.patch.dict(
+            os.environ,
+            {
+                "NVTE_CUTEDSL_FUSED_GROUPED_MLP": "0",
+                "NVTE_GROUPED_SWIGLU_GROUPED_LINEAR_FUSION": "1",
+            },
+        ):
+            with te.quantized_model_init(enabled=True, recipe=recipe):
+                module = te_ops.Sequential(
+                    te_ops.GroupedLinear(
+                        group_size,
+                        hidden_size,
+                        2 * hidden_size,
+                        bias=False,
+                        device=device,
+                        dtype=dtype,
+                    ),
+                    te_ops.SwiGLU(),
+                    te_ops.GroupedLinear(
+                        group_size,
+                        hidden_size,
+                        hidden_size,
+                        bias=False,
+                        device=device,
+                        dtype=dtype,
+                    ),
+                )
+
+            with te.autocast(enabled=True, recipe=recipe):
+                _ = module(x, split_sizes, split_sizes)
+
+        forward_ops = module._module_groups[0]._forward_ops
+        backward_ops = module._module_groups[0]._backward_ops
+        assert [type(op).__name__ for op, _ in forward_ops] == [
+            "GroupedLinear",
+            "ForwardGroupedSwiGLUGroupedLinear",
+        ]
+        assert [type(op).__name__ for op, _ in backward_ops] == [
+            "GroupedLinear",
+            "SwiGLU",
+            "GroupedLinear",
+        ]
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_grouped_linear_swiglu_grouped_linear_grouped_swiglu_fusion_numerics(
+        self,
+        *,
+        device: torch.device = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        group_size: int = 4,
+        hidden_size: int = 128,
+        split_alignment: int = 128,
+    ) -> None:
+        """Grouped SwiGLU fallback fusion should match unfused forward numerics."""
+        recipe = make_recipe("mxfp8")
+        split_sizes = torch.tensor([split_alignment] * group_size, dtype=torch.int64, device=device)
+        in_shape = (split_sizes.sum().item(), hidden_size)
+
+        x_base = torch.empty(in_shape, device=device, dtype=dtype).uniform_(-0.25, 0.25)
+
+        def _run(enable_fusion: bool) -> torch.Tensor:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NVTE_CUTEDSL_FUSED_GROUPED_MLP": "0",
+                    "NVTE_GROUPED_SWIGLU_GROUPED_LINEAR_FUSION": "1" if enable_fusion else "0",
+                },
+            ):
+                torch.manual_seed(1234)
+                with te.quantized_model_init(enabled=True, recipe=recipe):
+                    module = te_ops.Sequential(
+                        te_ops.GroupedLinear(
+                            group_size,
+                            hidden_size,
+                            2 * hidden_size,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        ),
+                        te_ops.SwiGLU(),
+                        te_ops.GroupedLinear(
+                            group_size,
+                            hidden_size,
+                            hidden_size,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        ),
+                    )
+
+                x = x_base.detach().clone()
+                with torch.no_grad(), te.autocast(enabled=True, recipe=recipe):
+                    y = module(x, split_sizes, split_sizes)
+                return y.detach()
+
+        y_ref = _run(False)
+        y_test = _run(True)
+
+        tols = quantization_tols("mxfp8")
+        assert_close(y_test, y_ref, **tols)
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    def test_grouped_linear_swiglu_grouped_linear_grouped_swiglu_fusion_backward_numerics(
+        self,
+        *,
+        device: torch.device = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        group_size: int = 4,
+        hidden_size: int = 128,
+        split_alignment: int = 128,
+    ) -> None:
+        """Grouped SwiGLU fallback fusion should match unfused forward/backward numerics."""
+        recipe = make_recipe("mxfp8")
+        split_sizes = torch.tensor([split_alignment] * group_size, dtype=torch.int64, device=device)
+        in_shape = (split_sizes.sum().item(), hidden_size)
+
+        x_base = torch.empty(in_shape, device=device, dtype=dtype).uniform_(-0.25, 0.25)
+        dy_base = torch.empty(in_shape, device=device, dtype=dtype).uniform_(-0.25, 0.25)
+
+        def _run(enable_fusion: bool) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NVTE_CUTEDSL_FUSED_GROUPED_MLP": "0",
+                    "NVTE_GROUPED_SWIGLU_GROUPED_LINEAR_FUSION": "1" if enable_fusion else "0",
+                },
+            ):
+                torch.manual_seed(1234)
+                with te.quantized_model_init(enabled=True, recipe=recipe):
+                    module = te_ops.Sequential(
+                        te_ops.GroupedLinear(
+                            group_size,
+                            hidden_size,
+                            2 * hidden_size,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        ),
+                        te_ops.SwiGLU(),
+                        te_ops.GroupedLinear(
+                            group_size,
+                            hidden_size,
+                            hidden_size,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        ),
+                    )
+
+                x = x_base.detach().clone().requires_grad_(True)
+                dy = dy_base.detach().clone()
+                module.zero_grad(set_to_none=True)
+                with te.autocast(enabled=True, recipe=recipe):
+                    y = module(x, split_sizes, split_sizes)
+                    y.backward(dy)
+                grad_params = {
+                    name: param.grad.detach().clone()
+                    for name, param in module.named_parameters()
+                    if param.grad is not None
+                }
+                return y.detach(), x.grad.detach(), grad_params
+
+        y_ref, dx_ref, grad_params_ref = _run(False)
+        y_test, dx_test, grad_params_test = _run(True)
+
+        tols = quantization_tols("mxfp8")
+        assert_close(y_test, y_ref, **tols)
+        assert_close(dx_test, dx_ref, **tols)
+        assert set(grad_params_test) == set(grad_params_ref)
+        for name in grad_params_ref:
+            assert_close(grad_params_test[name], grad_params_ref[name], **tols)
+
+    @pytest.mark.skipif(not mxfp8_available, reason=reason_for_no_mxfp8)
+    @pytest.mark.parametrize(
+        "split_sizes_list",
+        (
+            [128, 128, 128, 128],  # uniform, 128-aligned
+            [128, 256, 128, 512],  # uneven, 128-aligned
+            [256, 128, 384],  # uneven, 128-aligned, fewer groups
+        ),
+    )
+    def test_grouped_linear_swiglu_grouped_linear_grouped_swiglu_fusion_bitwise(
+        self,
+        split_sizes_list: list[int],
+        *,
+        device: torch.device = "cuda",
+        dtype: torch.dtype = torch.bfloat16,
+        hidden_size: int = 128,
+    ) -> None:
+        """Grouped SwiGLU fallback fusion must be *bitwise* identical to the unfused path.
+
+        The grouped MXFP8 path requires every group's token count to be
+        divisible by 128. Within that constraint, fusing SwiGLU into the grouped
+        quantize is layout-equivalent to the unfused activation followed by
+        ``group_quantize``, so forward and backward results must match exactly
+        (0 ULP), not merely within MXFP8 tolerance. This also exercises uneven
+        (but 128-aligned) group sizes, which the tolerance-based tests do not.
+        """
+        recipe = make_recipe("mxfp8")
+        group_size = len(split_sizes_list)
+        split_sizes = torch.tensor(split_sizes_list, dtype=torch.int64, device=device)
+        in_shape = (int(split_sizes.sum().item()), hidden_size)
+
+        x_base = torch.empty(in_shape, device=device, dtype=dtype).uniform_(-0.25, 0.25)
+        dy_base = torch.empty(in_shape, device=device, dtype=dtype).uniform_(-0.25, 0.25)
+
+        def _run(enable_fusion: bool) -> tuple[torch.Tensor, torch.Tensor, dict[str, torch.Tensor]]:
+            with mock.patch.dict(
+                os.environ,
+                {
+                    "NVTE_CUTEDSL_FUSED_GROUPED_MLP": "0",
+                    "NVTE_GROUPED_SWIGLU_GROUPED_LINEAR_FUSION": "1" if enable_fusion else "0",
+                },
+            ):
+                torch.manual_seed(1234)
+                with te.quantized_model_init(enabled=True, recipe=recipe):
+                    module = te_ops.Sequential(
+                        te_ops.GroupedLinear(
+                            group_size,
+                            hidden_size,
+                            2 * hidden_size,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        ),
+                        te_ops.SwiGLU(),
+                        te_ops.GroupedLinear(
+                            group_size,
+                            hidden_size,
+                            hidden_size,
+                            bias=False,
+                            device=device,
+                            dtype=dtype,
+                        ),
+                    )
+
+                x = x_base.detach().clone().requires_grad_(True)
+                dy = dy_base.detach().clone()
+                module.zero_grad(set_to_none=True)
+                with te.autocast(enabled=True, recipe=recipe):
+                    y = module(x, split_sizes, split_sizes)
+                    y.backward(dy)
+                if enable_fusion:
+                    fwd_op_names = [
+                        type(op).__name__ for op, _ in module._module_groups[0]._forward_ops
+                    ]
+                    assert "ForwardGroupedSwiGLUGroupedLinear" in fwd_op_names, fwd_op_names
+                grad_params = {
+                    name: param.grad.detach().clone()
+                    for name, param in module.named_parameters()
+                    if param.grad is not None
+                }
+                return y.detach(), x.grad.detach(), grad_params
+
+        y_ref, dx_ref, grad_params_ref = _run(False)
+        y_test, dx_test, grad_params_test = _run(True)
+
+        # Bitwise-exact: enabling the fused grouped SwiGLU path must not perturb numerics.
+        assert_close(y_test, y_ref, atol=0.0, rtol=0.0)
+        assert_close(dx_test, dx_ref, atol=0.0, rtol=0.0)
+        assert set(grad_params_test) == set(grad_params_ref)
+        for name in grad_params_ref:
+            assert_close(grad_params_test[name], grad_params_ref[name], atol=0.0, rtol=0.0)
 
     @pytest.mark.parametrize(
         "dtype",

@@ -901,7 +901,7 @@ class GroupedLinear(BasicOperation):
     def fuser_forward(
         self,
         basic_op_ctxs: list[OperationContext],
-        input_: torch.Tensor,
+        input_: torch.Tensor | GroupedTensorStorage,
         *,
         basic_op_extra_inputs: list[tuple[torch.Tensor, ...]],
         prev_op_grad_output_quantizer: Optional[Quantizer],
@@ -957,10 +957,12 @@ class GroupedLinear(BasicOperation):
         # in short it requires Blackwell (SM100+) plus a supported dtype /
         # quantization recipe. Otherwise we fall back to the legacy
         # ``tex.split_quantize`` + ``general_grouped_gemm`` flow.
-        use_grouped_tensor_path = self._is_graph_safe_path_supported(
-            with_quantized_compute=with_quantized_compute,
-            input_quantizers=input_quantizers,
-            dtype=dtype,
+        use_grouped_tensor_path = isinstance(input_, GroupedTensorStorage) or (
+            self._is_graph_safe_path_supported(
+                with_quantized_compute=with_quantized_compute,
+                input_quantizers=input_quantizers,
+                dtype=dtype,
+            )
         )
 
         if use_grouped_tensor_path:
@@ -1189,7 +1191,7 @@ class GroupedLinear(BasicOperation):
     def _fuser_forward_grouped_tensor(
         self,
         *,
-        input_: torch.Tensor,
+        input_: torch.Tensor | GroupedTensorStorage,
         split_sizes: torch.Tensor,
         scales: Optional[torch.Tensor],
         with_quantized_compute: bool,
@@ -1211,28 +1213,43 @@ class GroupedLinear(BasicOperation):
         base_split_offsets = tex.splits_to_offsets(split_sizes, 1)
         split_points = base_split_offsets[1:].to(dtype=torch.int)
 
-        # Flatten to 2D so the first dim is the total token count.
-        original_shape = list(input_.size())
-        x = maybe_dequantize(input_, dtype).reshape(-1, self.in_features)
-        total_tokens = x.size(0)
-
-        # Build the input GroupedTensor.
-        if with_quantized_compute:
-            input_quantizer = input_quantizers[0]
-            input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
-            input_quantizer.optimize_for_gemm = True
-            grouped_x = tex.group_quantize(x, input_quantizer, num_groups, split_sizes)
+        grouped_x: GroupedTensorStorage
+        if isinstance(input_, GroupedTensorStorage):
+            grouped_x = input_
+            total_tokens = int(grouped_x.logical_shape[0])
+            if int(grouped_x.logical_shape[1]) != self.in_features:
+                raise ValueError(
+                    "GroupedLinear grouped-input path expected logical_shape[1] "
+                    f"to be {self.in_features}, got {grouped_x.logical_shape[1]}."
+                )
+            original_shape = [total_tokens, self.in_features]
+            if with_quantized_compute:
+                input_quantizer = input_quantizers[0]
+                input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
+                input_quantizer.optimize_for_gemm = True
         else:
-            # No quantize: wrap the contiguous high-precision buffer.
-            grouped_x = GroupedTensorStorage(
-                shape=(total_tokens, self.in_features),
-                dtype=dtype,
-                num_tensors=num_groups,
-                quantizer=None,
-                data=x.reshape(-1),
-                first_dims=split_sizes,
-                tensor_offsets=base_split_offsets * self.in_features,
-            )
+            # Flatten to 2D so the first dim is the total token count.
+            original_shape = list(input_.size())
+            x = maybe_dequantize(input_, dtype).reshape(-1, self.in_features)
+            total_tokens = x.size(0)
+
+            # Build the input GroupedTensor.
+            if with_quantized_compute:
+                input_quantizer = input_quantizers[0]
+                input_quantizer.set_usage(rowwise=True, columnwise=weight_requires_grad)
+                input_quantizer.optimize_for_gemm = True
+                grouped_x = tex.group_quantize(x, input_quantizer, num_groups, split_sizes)
+            else:
+                # No quantize: wrap the contiguous high-precision buffer.
+                grouped_x = GroupedTensorStorage(
+                    shape=(total_tokens, self.in_features),
+                    dtype=dtype,
+                    num_tensors=num_groups,
+                    quantizer=None,
+                    data=x.reshape(-1),
+                    first_dims=split_sizes,
+                    tensor_offsets=base_split_offsets * self.in_features,
+                )
 
         if is_cpu_offload_enabled() and grouped_x is not None:
             start_offload(grouped_x)
@@ -1562,9 +1579,13 @@ class GroupedLinear(BasicOperation):
         else:
             ws, saved_tensors = saved_tensors[:num_groups], saved_tensors[num_groups:]
 
+        # Grad output can already be quantized (e.g., MXFP8 from activation
+        # backward). Materialize in compute dtype before grouped GEMM prep.
+        dy = maybe_dequantize(grad_output, dtype)
+
         # Flatten grad_output to 2D (total_tokens, out_features)
         # to figure out total tokens.
-        dy_2d = grad_output.reshape(-1, self.out_features)
+        dy_2d = dy.reshape(-1, self.out_features)
         total_tokens = dy_2d.size(0)
 
         # Build the grad_output GroupedTensor.
@@ -1622,7 +1643,7 @@ class GroupedLinear(BasicOperation):
         # ---- dgrad GEMM ----------------------------------------------------
         grad_input = None
         if ctx.input_requires_grad:
-            grad_input_shape = list(grad_output.size())[:-1] + [self.in_features]
+            grad_input_shape = list(dy.size())[:-1] + [self.in_features]
             grad_input = torch.empty(grad_input_shape, dtype=dtype, device=device)
             grouped_grad_input = GroupedTensorStorage(
                 shape=(total_tokens, self.in_features),

@@ -26,6 +26,39 @@ def _split_tuple(t: tuple, idx: int) -> tuple[tuple, tuple]:
     return t[:idx], t[idx:]
 
 
+_ACTIVATION_OP_NAMES_WITH_OUTPUT_QUANTIZE = frozenset(
+    (
+        "GELU",
+        "GEGLU",
+        "GLU",
+        "QGELU",
+        "QGEGLU",
+        "ReLU",
+        "ReGLU",
+        "SReLU",
+        "SReGLU",
+        "SiLU",
+        "SwiGLU",
+        "ClampedSwiGLU",
+    )
+)
+
+
+def _skip_next_op_input_quantizer(
+    op: FusibleOperation,
+    next_op: BasicOperation,
+) -> bool:
+    """Whether passing ``next_op`` quantizer into ``op`` is redundant.
+
+    GroupedLinear always builds a grouped input (and quantizes if needed), so
+    output quantization in preceding plain activation ops is redundant.
+    """
+    return (
+        type(next_op).__name__ == "GroupedLinear"
+        and type(op).__name__ in _ACTIVATION_OP_NAMES_WITH_OUTPUT_QUANTIZE
+    )
+
+
 # Lazily imported function used in _is_graph_capturing
 _is_graph_capturing_function: Optional[Callable[[], bool]] = None
 
@@ -130,6 +163,11 @@ class _OperationFuserAutogradFunction(torch.autograd.Function):
             next_op_input_quantizer = None
             if next_op is not None:
                 next_op_input_quantizer = next_op.get_input_quantizer()
+                if (
+                    next_op_input_quantizer is not None
+                    and _skip_next_op_input_quantizer(op, next_op)
+                ):
+                    next_op_input_quantizer = None
 
             x, fused_op_extra_outputs = op.fuser_forward(
                 [basic_op_ctxs[idx] for idx in basic_op_idxs],
