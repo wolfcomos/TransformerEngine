@@ -125,6 +125,27 @@ void nvte_quantize_noop(const NVTETensor input, NVTETensor output, NVTETensor no
 void nvte_quantize_v2(const NVTETensor input, NVTETensor output,
                       const NVTEQuantizationConfig quant_config, cudaStream_t stream);
 
+/*! \brief Fused row-scaled NVFP4 4over6 quantization for grouped (flat) storage.
+ *
+ *  The grouped row-scaled NVFP4 path expresses its contiguous grouped storage as
+ *  a flat [total_rows, hidden] tensor with one global amax per row. This entry
+ *  point fuses the per-row amax reduction and the 4over6 candidate selection into
+ *  a single kernel launch, replacing the two-launch nvte_quantize_v2 path
+ *  (compute_rowwise_amax followed by quantize_4over6) for that case.
+ *
+ *  The output must be a row-scaled NVFP4 tensor with rowwise data only, compact
+ *  (non GEMM-swizzled) scales, a non-disabled 4over6 mode, no 2D quantization and
+ *  no stochastic rounding. The fused output matches the two-launch path exactly.
+ *
+ *  \param[in]      input            Input tensor to be cast (flat [total_rows, hidden]).
+ *  \param[in,out]  output           Output row-scaled NVFP4 tensor (rowwise only).
+ *  \param[in]      quant_config     Quantization configuration (must enable 4over6).
+ *  \param[in]      stream           CUDA stream used for the operation.
+ */
+void nvte_group_quantize_4over6_row_scaled(const NVTETensor input, NVTETensor output,
+                                           const NVTEQuantizationConfig quant_config,
+                                           cudaStream_t stream);
+
 /*! \brief Casts input tensor to MXFP8. Additionally, reduces the input along columns.
  *         If the scaling mode of the output tensor is set to NVTE_MXFP8_1D_SCALING,
  *         the block quantization (MXFP8) of the specified shape of the block will be used.

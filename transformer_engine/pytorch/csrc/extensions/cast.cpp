@@ -208,6 +208,8 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
   NVTE_CHECK(!nvfp4_quantizer_cpp->with_2d_quantization,
              "2D scaling grouped quant kernel is not ready yet");
   if (row_scaled_nvfp4) {
+    NVTE_CHECK(nvfp4_use_4over6,
+               "Row-scaled NVFP4 grouped quantization is only supported with a 4over6 mode.");
     NVTE_CHECK(!nvfp4_quantizer_cpp->with_rht,
                "Row-scaled NVFP4 grouped quantization does not support RHT.");
     NVTE_CHECK(!nvfp4_quantizer_cpp->stochastic_rounding,
@@ -220,8 +222,11 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
     auto flat_output =
         make_flat_grouped_nvfp4_tensor(grouped_output_tensor, logical_shape, *nvfp4_quantizer_cpp);
     auto quant_config_cpp = make_nvfp4_quant_config(*nvfp4_quantizer_cpp);
+    // Row-scaled NVFP4 grouped quantization always uses the fused single-launch
+    // kernel (fused per-row amax + 4over6 candidate selection).
     NVTE_SCOPED_GIL_RELEASE({
-      nvte_quantize_v2(flat_input.data(), flat_output.data(), quant_config_cpp, stream);
+      nvte_group_quantize_4over6_row_scaled(flat_input.data(), flat_output.data(),
+                                            quant_config_cpp, stream);
     });
     return;
   }
@@ -567,8 +572,8 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
                                std::vector<size_t>{static_cast<size_t>(rowwise_data->numel())});
     if (rowwise_scale_inv.has_value()) {
       input_cpp.set_rowwise_scale_inv(rowwise_scale_inv->data_ptr(),
-                                      GetTransformerEngineDTypeForScaleInv(quantizer_py,
-                                                                           *rowwise_scale_inv),
+                                      detail::GetTransformerEngineDTypeForScaleInv(
+                                          quantizer_py, *rowwise_scale_inv),
                                       getTensorShape(*rowwise_scale_inv));
     }
   }
@@ -579,7 +584,7 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
     if (columnwise_scale_inv.has_value()) {
       input_cpp.set_columnwise_scale_inv(
           columnwise_scale_inv->data_ptr(),
-          GetTransformerEngineDTypeForScaleInv(quantizer_py, *columnwise_scale_inv),
+          detail::GetTransformerEngineDTypeForScaleInv(quantizer_py, *columnwise_scale_inv),
           getTensorShape(*columnwise_scale_inv));
     }
   }

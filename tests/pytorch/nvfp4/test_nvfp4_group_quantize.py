@@ -30,13 +30,23 @@ from nvfp4_utils import (
     swizzle_nvfp4_scale,
 )
 
+# Reuse the 4over6 exact-test infrastructure (PyTorch reference comparison matrix,
+# the err-fast-math env toggle, and the FP4 nibble unpacker) so the grouped tests
+# verify against the same NVFP4QuantizerRef contract as test_nvfp4_quantize_exact.
+from test_nvfp4_quantize_exact import (
+    NVFP4_4OVER6_CONFIGS,
+    nvfp4_4over6_err_fast_math,
+    unpack_fp4,
+)
+
 recipe_available, reason_for_no_recipe = te.is_nvfp4_available(return_reason=True)
 
 
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
-@pytest.mark.parametrize("use_4over6", [False, True], ids=["nvfp4", "4over6"])
+@pytest.mark.parametrize("use_4over6", [True], ids=["4over6"])
 def test_row_scaled_group_quantize_matches_flat_quantize(use_4over6: bool) -> None:
-    """Grouped row-scaled NVFP4 should reuse the flat Tensor quant/dequant path."""
+    """Grouped row-scaled NVFP4 (4over6) should match the flat Tensor quant/dequant
+    path. Grouped row-scaled quant is only supported with a 4over6 mode."""
 
     device = "cuda"
     torch.manual_seed(0)
@@ -87,6 +97,125 @@ def test_row_scaled_group_quantize_matches_flat_quantize(use_4over6: bool) -> No
         flat_dequantized,
         atol=0,
         rtol=0,
+    )
+
+
+def _roundup(value: int, multiple: int) -> int:
+    return ((value + multiple - 1) // multiple) * multiple
+
+
+def _valid_rowwise_scale_bytes(grouped, total_rows: int, hidden: int) -> torch.Tensor:
+    """Slice the written region out of the padded compact E4M3 scale buffer.
+
+    The grouped rowwise scale buffer is a single padded block of shape
+    ``[roundup(total_rows, 128), roundup(hidden / 16, 4)]`` (see
+    ``NVFP4Quantizer::get_scale_shape``). Only ``[total_rows, hidden / 16]`` is
+    written; the trailing rows/cols are padding that neither path touches, so
+    they hold nondeterministic allocation garbage and must be excluded from a
+    byte comparison.
+    """
+    sinv0 = _roundup(total_rows, 128)
+    sinv1 = _roundup(hidden // 16, 4)
+    flat = grouped.scale_inv.contiguous().view(torch.uint8).reshape(-1)
+    assert flat.numel() == sinv0 * sinv1, (flat.numel(), sinv0, sinv1)
+    block = flat.reshape(sinv0, sinv1)
+    return block[:total_rows, : hidden // 16].reshape(-1).clone()
+
+
+def _make_row_scaled_4over6_quantizer(err_mode: str, nvfp4_e4m3_max: int) -> NVFP4Quantizer:
+    return NVFP4Quantizer(
+        fp4_dtype=te.DType.kFloat4E2M1,
+        rowwise=True,
+        columnwise=False,
+        with_amax_reduction=False,
+        amax_reduction_group=None,
+        with_rht=False,
+        with_post_rht_amax=False,
+        with_2d_quantization=False,
+        stochastic_rounding=False,
+        row_scaled_nvfp4=True,
+        nvfp4_use_4over6=True,
+        nvfp4_e4m3_max=nvfp4_e4m3_max,
+        nvfp4_4over6_err_mode=err_mode,
+    )
+
+
+# Only the 4over6 configs are relevant: row-scaled grouped quant requires 4over6.
+_ROW_SCALED_4OVER6_CONFIGS = [cfg for cfg in NVFP4_4OVER6_CONFIGS if cfg.use_4over6]
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize(
+    "rows, hidden, splits",
+    [
+        (256, 512, [128, 128]),  # fully 128-aligned, no scale padding
+        (384, 320, [128, 128, 128]),  # hidden 320 -> 20 scale cols, 3 splits
+        (304, 512, [96, 208]),  # rows 304 -> padded scale rows, uneven splits
+        (640, 2064, [208, 432]),  # hidden 2064 -> padded scale cols, uneven splits
+        (1024, 7168, [512, 512]),  # larger, realistic shape
+    ],
+)
+@pytest.mark.parametrize(
+    "cfg", _ROW_SCALED_4OVER6_CONFIGS, ids=[cfg.id for cfg in _ROW_SCALED_4OVER6_CONFIGS]
+)
+def test_row_scaled_4over6_group_quantize_versus_reference(
+    rows: int, hidden: int, splits: list[int], cfg
+) -> None:
+    """The fused single-launch row-scaled 4over6 grouped kernel must be byte-exact
+    against the PyTorch reference (``NVFP4QuantizerRef``), the same contract that
+    ``test_nvfp4_quantize_exact`` enforces for the flat path.
+
+    Row-scaled 4over6 is purely per-row (no cross-group dependency), so the flat
+    ``[total_rows, hidden]`` reference quantization is the expected grouped result.
+    """
+    assert sum(splits) == rows and rows % 16 == 0 and hidden % 16 == 0
+
+    device = "cuda"
+    torch.manual_seed(1234)
+    torch.cuda.manual_seed(1234)
+
+    x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
+    first_dims = torch.tensor(splits, dtype=torch.int64, device=device)
+    quantizer = _make_row_scaled_4over6_quantizer(cfg.err_mode, cfg.e4m3_max)
+
+    # System under test: the fused grouped row-scaled 4over6 kernel. The error
+    # fast-math env is read live by the C++ adapter on each call.
+    with nvfp4_4over6_err_fast_math(cfg.err_use_fast_math):
+        grouped = tex.group_quantize(x, quantizer, len(splits), first_dims)
+
+    # Reference: NVFP4QuantizerRef on the flat input (per-row, no cross-group dep).
+    ref_quantizer = NVFP4QuantizerRef(
+        dtype=utils.Fp4Formats.E2M1,
+        rowwise=True,
+        columnwise=False,
+        pow_2_scales=False,
+        eps=0.0,
+        quant_tile_shape=(1, 16),
+        row_scaled_nvfp4=True,
+        nvfp4_use_4over6=True,
+        nvfp4_e4m3_max=cfg.e4m3_max,
+        nvfp4_4over6_err_mode=cfg.err_mode,
+        nvfp4_4over6_err_use_fast_math=cfg.err_use_fast_math,
+    )
+    x_ref = ref_quantizer.quantize(x)
+
+    # Packed FP4 data (compare unpacked nibbles).
+    qx = unpack_fp4(grouped.rowwise_data.view(dtype=torch.uint8).reshape(rows, hidden // 2))
+    qx_ref = unpack_fp4(x_ref.data.view(dtype=torch.uint8))
+    torch.testing.assert_close(qx, qx_ref, atol=0.0, rtol=0.0)
+
+    # Compact E4M3 scales: compare only the written (non-padding) region.
+    sx_ref = x_ref.scale.view(dtype=torch.uint8)
+    torch.testing.assert_close(
+        _valid_rowwise_scale_bytes(grouped, rows, hidden),
+        sx_ref.reshape(-1),
+        atol=0.0,
+        rtol=0.0,
+    )
+
+    # Per-row FP32 amax.
+    torch.testing.assert_close(
+        grouped.amax.reshape(-1), x_ref.global_amax_row.reshape(-1), atol=0.0, rtol=0.0
     )
 
 

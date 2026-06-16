@@ -99,6 +99,8 @@ TensorWrapper NVTETensorFromNVFP4Tensor(py::handle tensor, Quantizer *quantizer)
 
 GroupedTensorWrapper GroupedTensorFromPyTorchGroupedTensor(py::handle tensor);
 
+DType GetTransformerEngineDTypeForScaleInv(py::handle quantizer, at::Tensor scale_inv);
+
 inline bool IsFloatingPointType(at::ScalarType type) {
   return type == at::kFloat || type == at::kHalf || type == at::kBFloat16;
 }
