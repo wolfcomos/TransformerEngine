@@ -2038,6 +2038,8 @@ std::pair<GroupedTensorWrapper, py::object> NVFP4Quantizer::create_grouped_tenso
   }
 
   out_cpp.set_with_gemm_swizzled_scales(with_gemm_swizzled_scales);
+  out_cpp.set_row_scaled_nvfp4(row_scaled_nvfp4);
+  out_cpp.set_nvfp4_e4m3_max(nvfp4_e4m3_max);
 
   py::handle GroupedTensorClass = grouped_tensor_python_class(this->internal);
   py::dict kwargs;

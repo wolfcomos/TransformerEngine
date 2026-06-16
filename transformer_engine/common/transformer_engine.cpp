@@ -1234,6 +1234,14 @@ void nvte_set_grouped_tensor_param(NVTEGroupedTensor tensor, NVTEGroupedTensorPa
     case kNVTEGroupedWithGEMMSwizzledScales:
       t.with_gemm_swizzled_scales = static_cast<bool>(*reinterpret_cast<const uint8_t *>(buf));
       break;
+    case kNVTEGroupedRowScaledNVFP4:
+      t.row_scaled_nvfp4 = static_cast<bool>(*reinterpret_cast<const uint8_t *>(buf));
+      break;
+    case kNVTEGroupedNVFP4E4M3Max:
+      std::memcpy(&t.nvfp4_e4m3_max, buf, attr_size);
+      NVTE_CHECK(t.nvfp4_e4m3_max == 448 || t.nvfp4_e4m3_max == 256,
+                 "Unsupported grouped NVFP4 E4M3 max (got ", t.nvfp4_e4m3_max, ")");
+      break;
     default:
       NVTE_ERROR("Unsupported grouped tensor parameter (", static_cast<int>(param), ")");
   }
@@ -1328,6 +1336,12 @@ void nvte_get_grouped_tensor_param(const NVTEGroupedTensor tensor, NVTEGroupedTe
     }
     case kNVTEGroupedWithGEMMSwizzledScales:
       *reinterpret_cast<uint8_t *>(buf) = static_cast<uint8_t>(t->with_gemm_swizzled_scales);
+      break;
+    case kNVTEGroupedRowScaledNVFP4:
+      *reinterpret_cast<uint8_t *>(buf) = static_cast<uint8_t>(t->row_scaled_nvfp4);
+      break;
+    case kNVTEGroupedNVFP4E4M3Max:
+      std::memcpy(buf, &t->nvfp4_e4m3_max, attr_size);
       break;
     default:
       NVTE_ERROR("Unsupported grouped tensor parameter (", static_cast<int>(param), ")");

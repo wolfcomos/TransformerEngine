@@ -43,45 +43,6 @@ void allreduce_nvfp4_amax_tensors(NVFP4Quantizer *nvfp4_quantizer_cpp,
   });
 }
 
-std::vector<size_t> grouped_logical_shape(const GroupedTensorWrapper &grouped_tensor) {
-  const auto shape = grouped_tensor.logical_shape();
-  NVTE_CHECK(shape.ndim == 2, "Grouped NVFP4 tensor must have 2D logical shape.");
-  return std::vector<size_t>{shape.data[0], shape.data[1]};
-}
-
-TensorWrapper make_flat_grouped_input_tensor(const GroupedTensorWrapper &grouped_input_tensor,
-                                             const std::vector<size_t> &logical_shape) {
-  auto input_data = grouped_input_tensor.get_rowwise_data();
-  NVTE_CHECK(input_data.data_ptr != nullptr, "Grouped NVFP4 input rowwise data must be allocated.");
-
-  TensorWrapper flat_input(grouped_input_tensor.scaling_mode());
-  flat_input.set_rowwise_data(input_data.data_ptr, static_cast<DType>(input_data.dtype),
-                              logical_shape);
-  return flat_input;
-}
-
-TensorWrapper make_flat_grouped_nvfp4_tensor(const GroupedTensorWrapper &grouped_tensor,
-                                             const std::vector<size_t> &logical_shape,
-                                             const NVFP4Quantizer &quantizer) {
-  auto data = grouped_tensor.get_rowwise_data();
-  auto scale_inv = grouped_tensor.get_rowwise_scale_inv();
-  auto amax = grouped_tensor.get_amax();
-  NVTE_CHECK(data.data_ptr != nullptr, "Grouped NVFP4 rowwise data must be allocated.");
-  NVTE_CHECK(scale_inv.data_ptr != nullptr, "Grouped NVFP4 rowwise scale_inv must be allocated.");
-  NVTE_CHECK(amax.data_ptr != nullptr, "Grouped NVFP4 rowwise amax must be allocated.");
-
-  TensorWrapper flat_tensor(grouped_tensor.scaling_mode());
-  flat_tensor.set_rowwise_data(data.data_ptr, static_cast<DType>(data.dtype), logical_shape);
-  flat_tensor.set_rowwise_scale_inv(scale_inv.data_ptr, DType::kFloat8E4M3,
-                                    quantizer.get_scale_shape(logical_shape, false));
-  flat_tensor.set_amax(amax.data_ptr, DType::kFloat32, amax.shape);
-  flat_tensor.set_row_scaled_nvfp4(quantizer.row_scaled_nvfp4);
-  flat_tensor.set_nvfp4_e4m3_max(quantizer.nvfp4_e4m3_max);
-  flat_tensor.set_with_gemm_swizzled_scales(false);
-  quantizer.set_quantization_params(&flat_tensor);
-  return flat_tensor;
-}
-
 QuantizationConfigWrapper make_nvfp4_quant_config(const NVFP4Quantizer &quantizer) {
   QuantizationConfigWrapper quant_config;
   quant_config.set_nvfp4_4over6_mode(quantizer.nvfp4_4over6_mode);
@@ -217,16 +178,12 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
     NVTE_CHECK(!nvfp4_quantizer_cpp->with_amax_reduction,
                "Row-scaled NVFP4 grouped quantization does not support amax reduction.");
 
-    const auto logical_shape = grouped_logical_shape(grouped_input_tensor);
-    auto flat_input = make_flat_grouped_input_tensor(grouped_input_tensor, logical_shape);
-    auto flat_output =
-        make_flat_grouped_nvfp4_tensor(grouped_output_tensor, logical_shape, *nvfp4_quantizer_cpp);
     auto quant_config_cpp = make_nvfp4_quant_config(*nvfp4_quantizer_cpp);
     // Row-scaled NVFP4 grouped quantization always uses the fused single-launch
     // kernel (fused per-row amax + 4over6 candidate selection).
     NVTE_SCOPED_GIL_RELEASE({
-      nvte_group_quantize_4over6_row_scaled(flat_input.data(), flat_output.data(),
-                                            quant_config_cpp, stream);
+      nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor.data(),
+                          quant_config_cpp, stream);
     });
     return;
   }

@@ -47,24 +47,6 @@ void nvte_quantize_v2(const NVTETensor input, NVTETensor output,
   dispatch::quantize_fwd_helper<IS_ACT, Empty, nullptr>(input, output, quant_config, stream);
 }
 
-void nvte_group_quantize_4over6_row_scaled(const NVTETensor input, NVTETensor output,
-                                           const NVTEQuantizationConfig quant_config,
-                                           cudaStream_t stream) {
-  NVTE_API_CALL(nvte_group_quantize_4over6_row_scaled);
-  using namespace transformer_engine;
-
-  const Tensor *input_tensor = convertNVTETensorCheck(input);
-  Tensor *output_tensor = convertNVTETensorCheck(output);
-
-  QuantizationConfig quant_config_cpp;
-  if (quant_config != nullptr) {
-    quant_config_cpp = *reinterpret_cast<const QuantizationConfig *>(quant_config);
-  }
-
-  dispatch::nvfp4::group_quantize_4over6_row_scaled(*input_tensor, output_tensor, &quant_config_cpp,
-                                                    stream);
-}
-
 void nvte_dequantize(const NVTETensor input, NVTETensor output, cudaStream_t stream) {
   NVTE_API_CALL(nvte_dequantize);
   using namespace transformer_engine;
