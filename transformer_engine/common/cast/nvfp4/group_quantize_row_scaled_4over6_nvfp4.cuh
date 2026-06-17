@@ -4,7 +4,7 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-/*! \file group_quantize_4over6_nvfp4.cuh
+/*! \file group_quantize_row_scaled_4over6_nvfp4.cuh
  *  \brief Fused row-scaled NVFP4 4over6 grouped quantization.
  *
  *  The grouped row-scaled NVFP4 path stores all groups contiguously as a flat
@@ -20,8 +20,8 @@
  *  matches the two-launch path exactly for rowwise data, scale_inv and amax.
  */
 
-#ifndef TRANSFORMER_ENGINE_GROUP_QUANTIZE_4OVER6_NVFP4_CUH_
-#define TRANSFORMER_ENGINE_GROUP_QUANTIZE_4OVER6_NVFP4_CUH_
+#ifndef TRANSFORMER_ENGINE_GROUP_QUANTIZE_ROW_SCALED_4OVER6_NVFP4_CUH_
+#define TRANSFORMER_ENGINE_GROUP_QUANTIZE_ROW_SCALED_4OVER6_NVFP4_CUH_
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -43,7 +43,7 @@ namespace nvfp4 {
 
 #if FP4_TYPE_SUPPORTED
 
-namespace group_quantize_4over6_kernel {
+namespace group_quantize_row_scaled_4over6_kernel {
 
 // Reuse the registers-only 4over6 candidate helpers (compute_scale_pair,
 // make_candidates, select_scale, select_packed, store_packed_group, Config,
@@ -258,19 +258,19 @@ void launch_fused_row_scaled_4over6(const Tensor &input, const Tensor *noop, Ten
                                                        noop_ptr, rows, cols, scale_stride, stream);
 }
 
-}  // namespace group_quantize_4over6_kernel
+}  // namespace group_quantize_row_scaled_4over6_kernel
 
 #endif  // FP4_TYPE_SUPPORTED
 
 // Fused row-scaled NVFP4 4over6 grouped quantization. The grouped storage is
 // expressed as a flat [total_rows, hidden] tensor; the kernel is group-agnostic
 // because row-scaled 4over6 quantization has no cross-group dependency.
-inline void group_quantize_4over6_row_scaled(const Tensor &input, Tensor *output,
+inline void group_quantize_row_scaled_4over6(const Tensor &input, Tensor *output,
                                              const QuantizationConfig *quant_config,
                                              cudaStream_t stream) {
 #if FP4_TYPE_SUPPORTED
   using namespace quantize_4over6_kernel;
-  using namespace group_quantize_4over6_kernel;
+  using namespace group_quantize_row_scaled_4over6_kernel;
 
   checkCuDriverContext(stream);
   CheckInputTensor(input, "input");
@@ -315,8 +315,8 @@ inline void group_quantize_4over6_row_scaled(const Tensor &input, Tensor *output
                 using Cfg = quantize_4over6_kernel::Config<MODE, ERR_USE_FAST_MATH>;
                 TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
                     input.dtype(), IType,
-                    group_quantize_4over6_kernel::launch_fused_row_scaled_4over6<Cfg, E4M3_MAX,
-                                                                                 IType>(
+                    group_quantize_row_scaled_4over6_kernel::launch_fused_row_scaled_4over6<
+                        Cfg, E4M3_MAX, IType>(
                         input, noop, output, stream););
               });););
 
@@ -330,4 +330,4 @@ inline void group_quantize_4over6_row_scaled(const Tensor &input, Tensor *output
 }  // namespace dispatch
 }  // namespace transformer_engine
 
-#endif  // TRANSFORMER_ENGINE_GROUP_QUANTIZE_4OVER6_NVFP4_CUH_
+#endif  // TRANSFORMER_ENGINE_GROUP_QUANTIZE_ROW_SCALED_4OVER6_NVFP4_CUH_
