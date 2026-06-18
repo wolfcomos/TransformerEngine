@@ -188,8 +188,29 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
     return;
   }
 
-  NVTE_CHECK(!nvfp4_use_4over6,
-             "NVFP4 4over6 quantization is not supported for grouped quantization.");
+  if (nvfp4_use_4over6) {
+    NVTE_CHECK(!nvfp4_quantizer_cpp->with_rht,
+               "Grouped NVFP4 4over6 quantization does not support RHT.");
+    NVTE_CHECK(!nvfp4_quantizer_cpp->stochastic_rounding,
+               "Grouped NVFP4 4over6 quantization does not support stochastic rounding.");
+    NVTE_CHECK(!nvfp4_quantizer_cpp->with_amax_reduction,
+               "Grouped NVFP4 4over6 quantization does not support amax reduction.");
+    NVTE_CHECK(!compute_amax || grouped_input_tensor.dtype() == DType::kBFloat16,
+               "Grouped NVFP4 4over6 amax computation currently supports BF16 input only. "
+               "Use nvfp4_group_quantize_with_amax for precomputed amax with other dtypes.");
+
+    auto quant_config_cpp = make_nvfp4_quant_config(*nvfp4_quantizer_cpp);
+    NVTE_SCOPED_GIL_RELEASE({
+      if (compute_amax) {
+        nvte_group_amax_graph_safe(grouped_input_tensor.data(), grouped_output_tensor.data(),
+                                   stream);
+      }
+      nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor.data(),
+                          quant_config_cpp, stream);
+    });
+    return;
+  }
+
   NVTE_CHECK(nvfp4_quantizer_cpp->with_rht,
              "graph safe grouped quant kernel for non-RHT path is not ready yet");
   NVTE_CHECK(nvfp4_quantizer_cpp->with_post_rht_amax,
@@ -563,44 +584,44 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
                                  getTensorShape(*tensor_offsets));
   }
 
+  if (detail::IsNVFP4Quantizers(quantizer_py.ptr())) {
+    bool row_scaled_nvfp4 = false;
+    if (py::hasattr(input, "row_scaled_nvfp4")) {
+      row_scaled_nvfp4 = input.attr("row_scaled_nvfp4").cast<bool>();
+    } else if (py::hasattr(input, "_row_scaled_nvfp4")) {
+      row_scaled_nvfp4 = input.attr("_row_scaled_nvfp4").cast<bool>();
+    }
+    bool nvfp4_use_4over6 = false;
+    if (py::hasattr(input, "nvfp4_use_4over6")) {
+      nvfp4_use_4over6 = input.attr("nvfp4_use_4over6").cast<bool>();
+    } else if (py::hasattr(input, "_nvfp4_use_4over6")) {
+      nvfp4_use_4over6 = input.attr("_nvfp4_use_4over6").cast<bool>();
+    }
+    bool with_gemm_swizzled_scales = false;
+    if (py::hasattr(input, "with_gemm_swizzled_scales")) {
+      with_gemm_swizzled_scales = input.attr("with_gemm_swizzled_scales").cast<bool>();
+    } else if (py::hasattr(input, "_with_gemm_swizzled_scales")) {
+      with_gemm_swizzled_scales = input.attr("_with_gemm_swizzled_scales").cast<bool>();
+    }
+    int nvfp4_e4m3_max = 448;
+    if (py::hasattr(input, "nvfp4_e4m3_max")) {
+      nvfp4_e4m3_max = input.attr("nvfp4_e4m3_max").cast<int>();
+    } else if (py::hasattr(input, "_nvfp4_e4m3_max")) {
+      nvfp4_e4m3_max = input.attr("_nvfp4_e4m3_max").cast<int>();
+    }
+
+    NVTE_CHECK(nvfp4_use_4over6,
+               "Grouped NVFP4 dequantize is currently supported only for 4over6 recipe tensors.");
+    input_cpp.set_with_gemm_swizzled_scales(with_gemm_swizzled_scales);
+    input_cpp.set_row_scaled_nvfp4(row_scaled_nvfp4);
+    input_cpp.set_nvfp4_e4m3_max(nvfp4_e4m3_max);
+  }
+
   // Create output GroupedTensor using NoneQuantizer.
   NoneQuantizer q{py::none()};
   auto [out_cpp, out_py] =
       q.create_grouped_tensor(num_tensors, logical_shape, otype, py::none(), first_dims,
                               tensor_offsets, logical_first_dim, logical_last_dim);
-
-  const bool row_scaled_nvfp4 =
-      py::hasattr(input, "row_scaled_nvfp4") && input.attr("row_scaled_nvfp4").cast<bool>();
-  if (detail::IsNVFP4Quantizers(quantizer_py.ptr()) && row_scaled_nvfp4) {
-    NVTE_CHECK(rowwise_data.has_value(), "NVFP4 grouped dequantize requires rowwise data.");
-    NVTE_CHECK(rowwise_scale_inv.has_value(),
-               "NVFP4 grouped dequantize requires rowwise scale_inv.");
-    NVTE_CHECK(rowwise_amax.has_value(), "NVFP4 grouped dequantize requires rowwise amax.");
-
-    auto *nvfp4_quantizer_cpp = static_cast<NVFP4Quantizer *>(quantizer.get());
-    TensorWrapper flat_input(NVTE_NVFP4_1D_SCALING);
-    flat_input.set_rowwise_data(rowwise_data->data_ptr(), quantizer->dtype, logical_shape);
-    flat_input.set_rowwise_scale_inv(rowwise_scale_inv->data_ptr(), DType::kFloat8E4M3,
-                                     nvfp4_quantizer_cpp->get_scale_shape(logical_shape, false));
-    flat_input.set_amax(rowwise_amax->data_ptr(), DType::kFloat32, getTensorShape(*rowwise_amax));
-    if (py::hasattr(input, "_with_gemm_swizzled_scales")) {
-      flat_input.set_with_gemm_swizzled_scales(
-          input.attr("_with_gemm_swizzled_scales").cast<bool>());
-    }
-    flat_input.set_row_scaled_nvfp4(row_scaled_nvfp4);
-    if (py::hasattr(input, "nvfp4_e4m3_max")) {
-      flat_input.set_nvfp4_e4m3_max(input.attr("nvfp4_e4m3_max").cast<int>());
-    }
-
-    TensorWrapper flat_output;
-    auto output_data = out_cpp.get_rowwise_data();
-    flat_output.set_rowwise_data(output_data.data_ptr, otype, logical_shape);
-
-    NVTE_SCOPED_GIL_RELEASE({
-      nvte_dequantize(flat_input.data(), flat_output.data(), at::cuda::getCurrentCUDAStream());
-    });
-    return py::reinterpret_borrow<py::object>(out_py);
-  }
 
   NVTE_SCOPED_GIL_RELEASE({
     nvte_group_dequantize(input_cpp.data(), out_cpp.data(), at::cuda::getCurrentCUDAStream());

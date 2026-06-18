@@ -1987,7 +1987,8 @@ std::pair<GroupedTensorWrapper, py::object> NVFP4Quantizer::create_grouped_tenso
   const bool row_scaled_nvfp4 = this->row_scaled_nvfp4;
   const bool nvfp4_use_4over6 = this->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
   const int nvfp4_e4m3_max = this->nvfp4_e4m3_max;
-  const bool with_gemm_swizzled_scales = this->optimize_for_gemm && !row_scaled_nvfp4;
+  const bool with_gemm_swizzled_scales =
+      this->optimize_for_gemm && !row_scaled_nvfp4 && !nvfp4_use_4over6;
   if (row_scaled_nvfp4) {
     NVTE_CHECK(rowwise_usage, "Row-scaled NVFP4 grouped quantization requires rowwise usage.");
     NVTE_CHECK(!columnwise_usage,

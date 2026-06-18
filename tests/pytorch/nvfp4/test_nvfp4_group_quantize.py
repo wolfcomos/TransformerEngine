@@ -140,6 +140,71 @@ def _make_row_scaled_4over6_quantizer(err_mode: str, nvfp4_e4m3_max: int) -> NVF
     )
 
 
+def _make_4over6_quantizer(err_mode: str, nvfp4_e4m3_max: int) -> NVFP4Quantizer:
+    return NVFP4Quantizer(
+        fp4_dtype=te.DType.kFloat4E2M1,
+        rowwise=True,
+        columnwise=False,
+        with_amax_reduction=False,
+        amax_reduction_group=None,
+        with_rht=False,
+        with_post_rht_amax=False,
+        with_2d_quantization=False,
+        stochastic_rounding=False,
+        row_scaled_nvfp4=False,
+        nvfp4_use_4over6=True,
+        nvfp4_e4m3_max=nvfp4_e4m3_max,
+        nvfp4_4over6_err_mode=err_mode,
+    )
+
+
+def _assert_tensor_scaled_4over6_grouped_matches_flat(
+    grouped,
+    refs: list,
+    expected_amax: torch.Tensor,
+    splits: list[int],
+    rows: int,
+    hidden: int,
+) -> None:
+    packed_offset = 0
+    scale_rows = _roundup(rows, 128)
+    scale_cols = _roundup(hidden // 16, 4)
+    grouped_scales = grouped.scale_inv.contiguous().view(torch.uint8).reshape(
+        scale_rows, scale_cols
+    )
+    row_offset = 0
+    for split, ref in zip(splits, refs):
+        packed_elems = split * hidden // 2
+        torch.testing.assert_close(
+            grouped.rowwise_data[packed_offset : packed_offset + packed_elems],
+            ref._rowwise_data.view(dtype=torch.uint8).reshape(-1),
+            atol=0,
+            rtol=0,
+        )
+        valid_ref_scales = ref._rowwise_scale_inv.view(torch.uint8).reshape(
+            _roundup(split, 128), scale_cols
+        )[:split, : hidden // 16]
+        torch.testing.assert_close(
+            grouped_scales[row_offset : row_offset + split, : hidden // 16].reshape(-1),
+            valid_ref_scales.reshape(-1),
+            atol=0,
+            rtol=0,
+        )
+        packed_offset += packed_elems
+        row_offset += split
+
+    torch.testing.assert_close(grouped.amax, expected_amax, atol=0, rtol=0)
+
+    grouped_dequantized = tex.group_dequantize(grouped, te.DType.kBFloat16)
+    ref_dequantized = torch.cat([tex.dequantize(ref, te.DType.kBFloat16) for ref in refs], dim=0)
+    torch.testing.assert_close(
+        grouped_dequantized.rowwise_data.reshape(rows, hidden),
+        ref_dequantized,
+        atol=0,
+        rtol=0,
+    )
+
+
 # Only the 4over6 configs are relevant: row-scaled grouped quant requires 4over6.
 _ROW_SCALED_4OVER6_CONFIGS = [cfg for cfg in NVFP4_4OVER6_CONFIGS if cfg.use_4over6]
 
@@ -216,6 +281,61 @@ def test_row_scaled_4over6_group_quantize_versus_reference(
     # Per-row FP32 amax.
     torch.testing.assert_close(
         grouped.amax.reshape(-1), x_ref.global_amax_row.reshape(-1), atol=0.0, rtol=0.0
+    )
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+def test_non_row_scaled_4over6_group_quantize_with_amax_versus_flat() -> None:
+    """Grouped non-row-scaled 4over6 uses per-tensor amax and native grouped dequant."""
+
+    device = "cuda"
+    torch.manual_seed(5678)
+    torch.cuda.manual_seed(5678)
+
+    rows, hidden = 384, 512
+    splits = [128, 256]
+    first_dims = torch.tensor(splits, dtype=torch.int64, device=device)
+    x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
+    x_chunks = torch.split(x, splits)
+    quantizer = _make_4over6_quantizer("MAE", 448)
+
+    rowwise_amax = torch.stack([chunk.abs().amax().float() for chunk in x_chunks])
+    columnwise_amax = rowwise_amax.clone()
+
+    with nvfp4_4over6_err_fast_math(False):
+        grouped = tex.nvfp4_group_quantize_with_amax(
+            x, quantizer, len(splits), first_dims, rowwise_amax, columnwise_amax
+        )
+        refs = [quantizer(chunk) for chunk in x_chunks]
+
+    _assert_tensor_scaled_4over6_grouped_matches_flat(
+        grouped, refs, rowwise_amax, splits, rows, hidden
+    )
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+def test_non_row_scaled_4over6_group_quantize_computes_amax_versus_flat() -> None:
+    """Grouped non-row-scaled 4over6 computes per-tensor amax before native quantize."""
+
+    device = "cuda"
+    torch.manual_seed(8765)
+    torch.cuda.manual_seed(8765)
+
+    rows, hidden = 384, 512
+    splits = [128, 256]
+    first_dims = torch.tensor(splits, dtype=torch.int64, device=device)
+    x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
+    x_chunks = torch.split(x, splits)
+    quantizer = _make_4over6_quantizer("MAE", 448)
+
+    expected_amax = torch.stack([chunk.abs().amax().float() for chunk in x_chunks])
+
+    with nvfp4_4over6_err_fast_math(False):
+        grouped = tex.group_quantize(x, quantizer, len(splits), first_dims)
+        refs = [quantizer(chunk) for chunk in x_chunks]
+
+    _assert_tensor_scaled_4over6_grouped_matches_flat(
+        grouped, refs, expected_amax, splits, rows, hidden
     )
 
 
