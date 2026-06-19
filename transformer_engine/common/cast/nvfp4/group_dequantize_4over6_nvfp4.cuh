@@ -185,8 +185,8 @@ inline void group_dequantize_4over6(const GroupedTensor *input, GroupedTensor *o
           } else {
             NVTE_CHECK(e4m3_max == 448, "Unsupported NVFP4 E4M3 max (got ", e4m3_max, ")");
             launch_group_dequantize<OType, ROW_SCALED_NVFP4, 448>(input, output, stream);
-          }););  // NOLINT(*)
-  );             // NOLINT(*)
+          });  // NOLINT(*)
+  );           // NOLINT(*)
   NVTE_CHECK_CUDA(cudaGetLastError());
 #else
   NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
