@@ -20,6 +20,7 @@
 #include <cstdint>
 
 #include "../../common.h"
+#include "../../util/cuda_runtime.h"
 #include "../../util/math.h"
 #include "../../utils.cuh"
 #include "core_nvfp4.cuh"
@@ -141,18 +142,6 @@ void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
 // add one tiny shared-memory amax combine per row.
 constexpr int kFusedBlockWarps = 8;
 constexpr int kFusedThreads = kFusedBlockWarps * kWarpThreads;
-
-inline int fused_multiprocessor_count() {
-  static const int count = [] {
-    int device = 0;
-    int value = 0;
-    if (cudaGetDevice(&device) == cudaSuccess) {
-      cudaDeviceGetAttribute(&value, cudaDevAttrMultiProcessorCount, device);
-    }
-    return value > 0 ? value : 132;
-  }();
-  return count;
-}
 
 // Each row is processed by WARPS_PER_ROW cooperating warps (kRowThreads
 // threads). Pass 1 reduces the per-row amax across those threads; pass 2
@@ -277,7 +266,7 @@ void launch_fused_row_scaled_4over6(const IType *input, fp4e2m1x2 *output, nvfp4
     return;
   }
   const size_t num_groups = cols / kGroupSize;
-  const size_t goal_warps = static_cast<size_t>(fused_multiprocessor_count()) * 64;
+  const size_t goal_warps = static_cast<size_t>(transformer_engine::cuda::sm_count()) * 64;
   int warps_per_row = 1;
   while (warps_per_row < kFusedBlockWarps &&
          rows * static_cast<size_t>(warps_per_row) < goal_warps &&
