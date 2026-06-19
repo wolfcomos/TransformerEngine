@@ -4,10 +4,6 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-/*! \file group_quantize_4over6_nvfp4.cuh
- *  \brief Grouped NVFP4 4over6 quantization, including row-scaled fused quantization.
- */
-
 #ifndef TRANSFORMER_ENGINE_GROUP_QUANTIZE_4OVER6_NVFP4_CUH_
 #define TRANSFORMER_ENGINE_GROUP_QUANTIZE_4OVER6_NVFP4_CUH_
 
@@ -80,6 +76,21 @@ __device__ __forceinline__ void load_global_col_group(const IType *input,
   }
 }
 
+template <typename Cfg, int E4M3_MAX>
+__device__ __forceinline__ void store_quantized_group(float (&x0)[kElementsPerHalfGroup],
+                                                      float (&x1)[kElementsPerHalfGroup],
+                                                      const float block_amax,
+                                                      const float global_amax,
+                                                      nvfp4_scale_t *scale_out,
+                                                      fp4e2m1x2 *output) {
+  const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, global_amax);
+  const CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
+  const bool pick_map4 = candidates.map4.err < candidates.map6.err;
+
+  *scale_out = select_scale(scale_pair, pick_map4);
+  store_packed_group(select_packed(candidates, pick_map4), output);
+}
+
 template <typename Cfg, int E4M3_MAX, typename IType>
 __device__ __forceinline__ void quantize_group_rowwise(
     const IType *__restrict__ input, fp4e2m1x2 *__restrict__ output,
@@ -103,15 +114,9 @@ __device__ __forceinline__ void quantize_group_rowwise(
   float block_amax = 0.0f;
   load_global_row_group(input, row, cols, col, x0, x1, &block_amax);
 
-  const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, global_amax);
-  const CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
-
-  const bool pick_map4 = candidates.map4.err < candidates.map6.err;
-  const nvfp4_scale_t selected_scale = select_scale(scale_pair, pick_map4);
-  const uint32_t *selected = select_packed(candidates, pick_map4);
-
-  scales[row * scale_stride + col_group] = selected_scale;
-  store_packed_group(selected, &output[(row * cols + col) / 2]);
+  store_quantized_group<Cfg, E4M3_MAX>(x0, x1, block_amax, global_amax,
+                                       &scales[row * scale_stride + col_group],
+                                       &output[(row * cols + col) / 2]);
 }
 
 template <typename Cfg, int E4M3_MAX, typename IType>
@@ -144,21 +149,15 @@ __device__ __forceinline__ void quantize_group_colwise(
   float block_amax = 0.0f;
   load_global_col_group(input, row_start, cols, col, x0, x1, &block_amax);
 
-  const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, global_amax);
-  const CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
-
-  const bool pick_map4 = candidates.map4.err < candidates.map6.err;
-  const nvfp4_scale_t selected_scale = select_scale(scale_pair, pick_map4);
-  const uint32_t *selected = select_packed(candidates, pick_map4);
-
   const size_t tensor_scale_offset = group_4over6::columnwise_scale_offset_from_id(
       tensor_id, rows, cols, num_tensors, has_first_dims, offsets);
   const size_t tensor_scale_stride = group_4over6::columnwise_scale_cols_device(tensor_rows);
-  scales_t[tensor_scale_offset + col * tensor_scale_stride + local_row / kGroupSize] =
-      selected_scale;
   const size_t tensor_packed_offset = (tensor_row_start * cols) / 2;
   const size_t tensor_colwise_offset = tensor_packed_offset + (col * tensor_rows + local_row) / 2;
-  store_packed_group(selected, &output_t[tensor_colwise_offset]);
+  store_quantized_group<Cfg, E4M3_MAX>(
+      x0, x1, block_amax, global_amax,
+      &scales_t[tensor_scale_offset + col * tensor_scale_stride + local_row / kGroupSize],
+      &output_t[tensor_colwise_offset]);
 }
 
 template <bool RETURN_ROWWISE, bool RETURN_COLUMNWISE, typename Cfg, int E4M3_MAX, typename IType>
@@ -226,25 +225,9 @@ void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
                                    output->first_dims.dptr != nullptr, noop_ptr);
 }
 
-// A group of WARPS_PER_ROW warps cooperates on one row; a fixed 256-thread CTA
-// (kFusedBlockWarps warps) therefore holds kFusedBlockWarps / WARPS_PER_ROW
-// rows. Per-row work (amax reduction + per-1x16-group 4over6 quantization)
-// stays warp-local, so threads are fully utilized for any hidden size, and
-// WARPS_PER_ROW is chosen at launch so the total warp count (rows *
-// WARPS_PER_ROW) fills the GPU even for small row counts -- the regime where
-// occupancy, not per-row work, is the bottleneck. WARPS_PER_ROW == 1 needs no
-// cross-warp coordination (the fast path for large row counts); larger values
-// add one tiny shared-memory amax combine per row.
 constexpr int kFusedBlockWarps = 8;
 constexpr int kFusedThreads = kFusedBlockWarps * kWarpThreads;
 
-// Each row is processed by WARPS_PER_ROW cooperating warps (kRowThreads
-// threads). Pass 1 reduces the per-row amax across those threads; pass 2
-// quantizes every 1x16 group with 4over6 candidate selection. The input row is
-// read twice from global memory, which still replaces two kernel launches
-// (compute_rowwise_amax + quantize_4over6) with one. max-of-abs is associative
-// and commutative and BF16/FP16 -> FP32 is exact, so the result is bit-identical
-// to the two-launch path regardless of how the reduction is split across warps.
 template <int WARPS_PER_ROW, typename Cfg, int E4M3_MAX, typename IType>
 __global__ void __launch_bounds__(kFusedThreads)
     fused_row_scaled_4over6_kernel(const IType *__restrict__ input,
@@ -325,15 +308,9 @@ __global__ void __launch_bounds__(kFusedThreads)
       block_amax = fmaxf(block_amax, fabsf(v1));
     }
 
-    const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, row_amax);
-    const CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, row_amax);
-
-    const bool pick_map4 = candidates.map4.err < candidates.map6.err;
-    const nvfp4_scale_t selected_scale = select_scale(scale_pair, pick_map4);
-    const uint32_t *selected = select_packed(candidates, pick_map4);
-
-    scales[row * scale_stride + g] = selected_scale;
-    store_packed_group(selected, &output[(row * cols + col) / 2]);
+    store_quantized_group<Cfg, E4M3_MAX>(x0, x1, block_amax, row_amax,
+                                         &scales[row * scale_stride + g],
+                                         &output[(row * cols + col) / 2]);
   }
 #else
   NVTE_DEVICE_ERROR("sm_100 or higher is required.");
@@ -412,9 +389,6 @@ void launch_fused_row_scaled_4over6(const Tensor &input, const Tensor *noop, Ten
 
 #endif  // FP4_TYPE_SUPPORTED
 
-// Fused row-scaled NVFP4 4over6 grouped quantization. The grouped storage is
-// expressed as a flat [total_rows, hidden] tensor; the kernel is group-agnostic
-// because row-scaled 4over6 quantization has no cross-group dependency.
 inline void group_quantize_row_scaled_4over6(const Tensor &input, Tensor *output,
                                              const QuantizationConfig *quant_config,
                                              cudaStream_t stream) {
@@ -508,11 +482,6 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   const size_t cols = logical_shape[1];
   const bool return_rowwise = output->has_data();
   const bool return_columnwise = output->has_columnwise_data();
-  const auto rowwise_scale_shape = group_4over6::rowwise_scale_shape(rows, cols);
-  std::vector<size_t> columnwise_scale_shape;
-  if (return_columnwise) {
-    columnwise_scale_shape = group_4over6::columnwise_scale_shape(rows, cols);
-  }
 
   NVTE_CHECK(input->data.numel() == rows * cols,
              "Grouped NVFP4 4over6 input rowwise data has wrong size.");
@@ -523,7 +492,7 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
                "Grouped NVFP4 4over6 quantization requires rowwise scale_inv.");
     NVTE_CHECK(output->scale_inv.dtype == DType::kFloat8E4M3,
                "Grouped NVFP4 4over6 rowwise scale_inv must have Float8E4M3 dtype.");
-    NVTE_CHECK(output->scale_inv.numel() == product(rowwise_scale_shape),
+    NVTE_CHECK(output->scale_inv.numel() == product(group_4over6::rowwise_scale_shape(rows, cols)),
                "Grouped NVFP4 4over6 rowwise scale_inv has wrong size.");
     NVTE_CHECK(is_fp4_dtype(output->data.dtype),
                "Grouped NVFP4 4over6 rowwise output must have FP4 type.");
@@ -542,7 +511,8 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
                "Grouped NVFP4 4over6 quantization requires columnwise scale_inv.");
     NVTE_CHECK(output->columnwise_scale_inv.dtype == DType::kFloat8E4M3,
                "Grouped NVFP4 4over6 columnwise scale_inv must have Float8E4M3 dtype.");
-    NVTE_CHECK(output->columnwise_scale_inv.numel() == product(columnwise_scale_shape),
+    NVTE_CHECK(output->columnwise_scale_inv.numel() ==
+                   product(group_4over6::columnwise_scale_shape(rows, cols)),
                "Grouped NVFP4 4over6 columnwise scale_inv has wrong size.");
     NVTE_CHECK(is_fp4_dtype(output->columnwise_data.dtype),
                "Grouped NVFP4 4over6 columnwise output must have FP4 type.");

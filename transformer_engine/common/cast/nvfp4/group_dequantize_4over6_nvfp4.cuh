@@ -4,10 +4,6 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-/*! \file group_dequantize_4over6_nvfp4.cuh
- *  \brief Grouped NVFP4 dequantization for tensors produced by the 4over6 recipe.
- */
-
 #ifndef TRANSFORMER_ENGINE_GROUP_DEQUANTIZE_4OVER6_NVFP4_CUH_
 #define TRANSFORMER_ENGINE_GROUP_DEQUANTIZE_4OVER6_NVFP4_CUH_
 
@@ -35,6 +31,11 @@ namespace group_dequantize_4over6_kernel {
 constexpr int kThreads = 256;
 constexpr size_t kGroupSize = group_4over6::kGroupSize;
 
+union fp4vec {
+  uint64_t vec;
+  fp4e2m1x4 small_vec[4];
+};
+
 template <typename OType, bool ROW_SCALED_NVFP4, int E4M3_MAX>
 __global__ void __launch_bounds__(kThreads)
     group_dequantize_fp4_rowwise_kernel(
@@ -51,10 +52,6 @@ __global__ void __launch_bounds__(kThreads)
     return;
   }
 
-  union fp4vec {
-    uint64_t vec;
-    fp4e2m1x4 small_vec[4];
-  };
   using OVec = Vec<OType, 4>;
 
   const auto *const input_vectorized = reinterpret_cast<const uint64_t *>(input);
@@ -103,11 +100,6 @@ __global__ void __launch_bounds__(kThreads)
   if (col >= cols) {
     return;
   }
-
-  union fp4vec {
-    uint64_t vec;
-    fp4e2m1x4 small_vec[4];
-  };
 
   const auto *const input_vectorized = reinterpret_cast<const uint64_t *>(input);
   const size_t row_start = row_group * kGroupSize;
@@ -230,11 +222,6 @@ inline void group_dequantize_4over6(const GroupedTensor *input, GroupedTensor *o
              "Grouped NVFP4 4over6 input and output logical shapes must match.");
   const size_t rows = logical_shape[0];
   const size_t cols = logical_shape[1];
-  const auto rowwise_scale_shape = group_4over6::rowwise_scale_shape(rows, cols);
-  std::vector<size_t> columnwise_scale_shape;
-  if (input->has_columnwise_data()) {
-    columnwise_scale_shape = group_4over6::columnwise_scale_shape(rows, cols);
-  }
 
   if (input->has_data()) {
     NVTE_CHECK(input->data.numel() == rows * cols / 2,
@@ -254,7 +241,7 @@ inline void group_dequantize_4over6(const GroupedTensor *input, GroupedTensor *o
                "Grouped NVFP4 4over6 dequantize requires rowwise scale_inv.");
     NVTE_CHECK(input->scale_inv.dtype == DType::kFloat8E4M3,
                "Grouped NVFP4 4over6 rowwise scale_inv must have Float8E4M3 dtype.");
-    NVTE_CHECK(input->scale_inv.numel() == product(rowwise_scale_shape),
+    NVTE_CHECK(input->scale_inv.numel() == product(group_4over6::rowwise_scale_shape(rows, cols)),
                "Grouped NVFP4 4over6 rowwise scale_inv has wrong size.");
     NVTE_CHECK(input->amax.dptr != nullptr, "Grouped NVFP4 4over6 rowwise dequantize requires amax.");
   }
@@ -263,7 +250,8 @@ inline void group_dequantize_4over6(const GroupedTensor *input, GroupedTensor *o
                "Grouped NVFP4 4over6 dequantize requires columnwise scale_inv.");
     NVTE_CHECK(input->columnwise_scale_inv.dtype == DType::kFloat8E4M3,
                "Grouped NVFP4 4over6 columnwise scale_inv must have Float8E4M3 dtype.");
-    NVTE_CHECK(input->columnwise_scale_inv.numel() == product(columnwise_scale_shape),
+    NVTE_CHECK(input->columnwise_scale_inv.numel() ==
+                   product(group_4over6::columnwise_scale_shape(rows, cols)),
                "Grouped NVFP4 4over6 columnwise scale_inv has wrong size.");
     NVTE_CHECK(input->columnwise_amax.dptr != nullptr || input->amax.dptr != nullptr,
                "Grouped NVFP4 4over6 columnwise dequantize requires columnwise amax or rowwise "

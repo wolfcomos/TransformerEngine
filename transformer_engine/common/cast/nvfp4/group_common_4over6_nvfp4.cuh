@@ -4,10 +4,6 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-/*! \file group_common_4over6_nvfp4.cuh
- *  \brief Shared helpers for grouped NVFP4 4over6 recipe paths.
- */
-
 #ifndef TRANSFORMER_ENGINE_GROUP_COMMON_4OVER6_NVFP4_CUH_
 #define TRANSFORMER_ENGINE_GROUP_COMMON_4OVER6_NVFP4_CUH_
 
@@ -32,7 +28,7 @@ inline std::vector<size_t> logical_shape_2d(const GroupedTensor &tensor, const c
   return std::vector<size_t>{tensor.logical_shape.data[0], tensor.logical_shape.data[1]};
 }
 
-inline size_t rowwise_scale_rows(const size_t rows) {
+inline size_t scale_rows(const size_t rows) {
   return DIVUP_TO_MULTIPLE(rows, static_cast<size_t>(128));
 }
 
@@ -43,11 +39,7 @@ inline size_t rowwise_scale_cols(const size_t cols) {
 }
 
 inline std::vector<size_t> rowwise_scale_shape(const size_t rows, const size_t cols) {
-  return std::vector<size_t>{rowwise_scale_rows(rows), rowwise_scale_cols(cols)};
-}
-
-inline size_t columnwise_scale_rows(const size_t cols) {
-  return rowwise_scale_rows(cols);
+  return std::vector<size_t>{scale_rows(rows), rowwise_scale_cols(cols)};
 }
 
 inline size_t columnwise_scale_cols(const size_t rows) {
@@ -57,7 +49,7 @@ inline size_t columnwise_scale_cols(const size_t rows) {
 }
 
 inline std::vector<size_t> columnwise_scale_shape(const size_t rows, const size_t cols) {
-  return std::vector<size_t>{columnwise_scale_rows(cols), columnwise_scale_cols(rows)};
+  return std::vector<size_t>{scale_rows(cols), columnwise_scale_cols(rows)};
 }
 
 inline Tensor make_grouped_input_tensor_view(const GroupedTensor &grouped_input,
@@ -75,8 +67,8 @@ inline Tensor make_grouped_input_tensor_view(const GroupedTensor &grouped_input,
   return input_view;
 }
 
-inline Tensor make_grouped_rowwise_output_tensor_view(const GroupedTensor &grouped_output,
-                                                      const char *name) {
+inline Tensor make_row_scaled_grouped_output_tensor_view(const GroupedTensor &grouped_output,
+                                                         const char *name) {
   const auto logical_shape = logical_shape_2d(grouped_output, name);
   const size_t rows = logical_shape[0];
   const size_t cols = logical_shape[1];
@@ -98,6 +90,8 @@ inline Tensor make_grouped_rowwise_output_tensor_view(const GroupedTensor &group
   NVTE_CHECK(grouped_output.amax.dptr != nullptr, name, " rowwise amax must be allocated.");
   NVTE_CHECK(grouped_output.amax.dtype == DType::kFloat32, name,
              " rowwise amax must have Float32 dtype.");
+  NVTE_CHECK(grouped_output.amax.numel() == rows, name, " row-scaled amax must have ", rows,
+             " entries, got ", grouped_output.amax.shape, ".");
 
   Tensor output_view;
   output_view.scaling_mode = grouped_output.scaling_mode;
@@ -108,15 +102,6 @@ inline Tensor make_grouped_rowwise_output_tensor_view(const GroupedTensor &group
   output_view.with_gemm_swizzled_scales = grouped_output.with_gemm_swizzled_scales;
   output_view.row_scaled_nvfp4 = grouped_output.row_scaled_nvfp4;
   output_view.nvfp4_e4m3_max = grouped_output.nvfp4_e4m3_max;
-  return output_view;
-}
-
-inline Tensor make_row_scaled_grouped_output_tensor_view(const GroupedTensor &grouped_output,
-                                                         const char *name) {
-  Tensor output_view = make_grouped_rowwise_output_tensor_view(grouped_output, name);
-  const size_t rows = output_view.flat_first_dim();
-  NVTE_CHECK(grouped_output.amax.numel() == rows, name, " row-scaled amax must have ", rows,
-             " entries, got ", grouped_output.amax.shape, ".");
   output_view.amax =
       SimpleTensor(grouped_output.amax.dptr, std::vector<size_t>{rows}, grouped_output.amax.dtype);
   return output_view;
