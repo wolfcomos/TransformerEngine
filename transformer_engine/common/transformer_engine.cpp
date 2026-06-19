@@ -314,16 +314,21 @@ void CheckGroupedTensorShapeArrays(const GroupedTensor &t, std::string_view name
                " columnwise_data must be 1D");
   }
 
-  // Validate data size matches logical_shape
+  // Validate data size matches logical_shape. FP4 packs two elements per storage
+  // unit, so the data buffer holds half as many elements as the logical shape.
   size_t expected_numel = t.logical_shape.data[0] * t.logical_shape.data[1];
   if (t.has_data()) {
-    NVTE_CHECK(t.data.numel() == expected_numel, "Grouped tensor ", name, " data size (",
-               t.data.numel(), ") must match logical_shape size (", expected_numel, ")");
+    const size_t expected_data_numel =
+        is_fp4_dtype(t.data.dtype) ? expected_numel / 2 : expected_numel;
+    NVTE_CHECK(t.data.numel() == expected_data_numel, "Grouped tensor ", name, " data size (",
+               t.data.numel(), ") must match logical_shape size (", expected_data_numel, ")");
   }
   if (t.has_columnwise_data()) {
-    NVTE_CHECK(t.columnwise_data.numel() == expected_numel, "Grouped tensor ", name,
+    const size_t expected_columnwise_numel =
+        is_fp4_dtype(t.columnwise_data.dtype) ? expected_numel / 2 : expected_numel;
+    NVTE_CHECK(t.columnwise_data.numel() == expected_columnwise_numel, "Grouped tensor ", name,
                " columnwise_data size (", t.columnwise_data.numel(),
-               ") must match logical_shape size (", expected_numel, ")");
+               ") must match logical_shape size (", expected_columnwise_numel, ")");
   }
 }
 

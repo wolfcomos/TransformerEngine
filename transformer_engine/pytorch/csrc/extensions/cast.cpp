@@ -534,7 +534,9 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
 
   // Early-return for empty input.
   if (logical_first_dim == 0 || logical_last_dim == 0) {
+    // Dequantized output is high precision and rowwise only.
     NoneQuantizer q{py::none()};
+    q.columnwise_usage = false;
     auto [out_cpp, out_py] =
         q.create_grouped_tensor(num_tensors, logical_shape, otype, py::none(), first_dims,
                                 tensor_offsets, logical_first_dim, logical_last_dim);
@@ -618,7 +620,9 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
   }
 
   // Create output GroupedTensor using NoneQuantizer.
+  // Dequantized output is high precision and rowwise only.
   NoneQuantizer q{py::none()};
+  q.columnwise_usage = false;
   auto [out_cpp, out_py] =
       q.create_grouped_tensor(num_tensors, logical_shape, otype, py::none(), first_dims,
                               tensor_offsets, logical_first_dim, logical_last_dim);
