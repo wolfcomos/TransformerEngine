@@ -475,14 +475,17 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
                  "Grouped NVFP4 4over6 quantization does not support stochastic rounding.");
       NVTE_CHECK(input_tensor->has_data(),
                  "Grouped NVFP4 4over6 input rowwise data must be allocated.");
-      NVTE_CHECK(output_tensor->has_data(),
-                 "Grouped NVFP4 4over6 output rowwise data must be allocated.");
-      NVTE_CHECK(!output_tensor->has_columnwise_data(),
-                 "Grouped NVFP4 4over6 quantization currently does not support columnwise output.");
+      NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
+                 "Grouped NVFP4 4over6 output rowwise or columnwise data must be allocated.");
       NVTE_CHECK(!output_tensor->with_gemm_swizzled_scales,
                  "Grouped NVFP4 4over6 quantization requires compact scale layout.");
 
       if (output_tensor->row_scaled_nvfp4) {
+        NVTE_CHECK(output_tensor->has_data(),
+                   "Row-scaled grouped NVFP4 4over6 quantization requires rowwise output data.");
+        NVTE_CHECK(!output_tensor->has_columnwise_data(),
+                   "Row-scaled grouped NVFP4 4over6 quantization does not support columnwise "
+                   "output.");
         Tensor input_view =
             nvfp4::group_4over6::make_grouped_input_tensor_view(*input_tensor,
                                                                 "Grouped quantize input");

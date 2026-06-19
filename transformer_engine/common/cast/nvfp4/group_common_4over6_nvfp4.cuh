@@ -23,13 +23,12 @@ namespace dispatch {
 namespace nvfp4 {
 namespace group_4over6 {
 
-constexpr size_t kBlockSize = 16;
+constexpr size_t kGroupSize = 16;
 
 inline std::vector<size_t> logical_shape_2d(const GroupedTensor &tensor, const char *name) {
   NVTE_CHECK(tensor.num_tensors > 0, name, " must contain at least one tensor.");
   NVTE_CHECK(tensor.logical_shape.ndim == 2, name, " must have 2D logical shape.");
-  NVTE_CHECK(tensor.logical_shape.data[0] > 0 && tensor.logical_shape.data[1] > 0, name,
-             " must have positive logical dimensions.");
+  NVTE_CHECK(tensor.logical_shape.data[1] > 0, name, " must have positive last dimension.");
   return std::vector<size_t>{tensor.logical_shape.data[0], tensor.logical_shape.data[1]};
 }
 
@@ -38,13 +37,27 @@ inline size_t rowwise_scale_rows(const size_t rows) {
 }
 
 inline size_t rowwise_scale_cols(const size_t cols) {
-  NVTE_CHECK(cols % kBlockSize == 0,
-             "Grouped NVFP4 4over6 requires last dim divisible by ", kBlockSize, ".");
-  return DIVUP_TO_MULTIPLE(cols / kBlockSize, static_cast<size_t>(4));
+  NVTE_CHECK(cols % kGroupSize == 0,
+             "Grouped NVFP4 4over6 requires last dim divisible by ", kGroupSize, ".");
+  return DIVUP_TO_MULTIPLE(cols / kGroupSize, static_cast<size_t>(4));
 }
 
 inline std::vector<size_t> rowwise_scale_shape(const size_t rows, const size_t cols) {
   return std::vector<size_t>{rowwise_scale_rows(rows), rowwise_scale_cols(cols)};
+}
+
+inline size_t columnwise_scale_rows(const size_t cols) {
+  return rowwise_scale_rows(cols);
+}
+
+inline size_t columnwise_scale_cols(const size_t rows) {
+  NVTE_CHECK(rows % kGroupSize == 0,
+             "Grouped NVFP4 4over6 columnwise requires first dim divisible by ", kGroupSize, ".");
+  return DIVUP_TO_MULTIPLE(rows / kGroupSize, static_cast<size_t>(4));
+}
+
+inline std::vector<size_t> columnwise_scale_shape(const size_t rows, const size_t cols) {
+  return std::vector<size_t>{columnwise_scale_rows(cols), columnwise_scale_cols(rows)};
 }
 
 inline Tensor make_grouped_input_tensor_view(const GroupedTensor &grouped_input,
@@ -146,6 +159,51 @@ __device__ __forceinline__ size_t tensor_id_from_row(
     }
   }
   return low - 1;
+}
+
+__device__ __forceinline__ size_t tensor_start_row_from_id(
+    const size_t tensor_id, const size_t rows, const size_t cols, const size_t num_tensors,
+    const bool has_first_dims, const int64_t *const __restrict__ offsets) {
+  if (!has_first_dims) {
+    return tensor_id * (rows / num_tensors);
+  }
+  return static_cast<size_t>(offsets[tensor_id]) / cols;
+}
+
+__device__ __forceinline__ size_t tensor_rows_from_id(
+    const size_t tensor_id, const size_t rows, const size_t cols, const size_t num_tensors,
+    const bool has_first_dims, const int64_t *const __restrict__ offsets) {
+  if (!has_first_dims) {
+    return rows / num_tensors;
+  }
+  return (static_cast<size_t>(offsets[tensor_id + 1]) - static_cast<size_t>(offsets[tensor_id])) /
+         cols;
+}
+
+__device__ __forceinline__ size_t columnwise_scale_rows_device(const size_t cols) {
+  return ((cols + 127) / 128) * 128;
+}
+
+__device__ __forceinline__ size_t columnwise_scale_cols_device(const size_t rows) {
+  return (((rows / kGroupSize) + 3) / 4) * 4;
+}
+
+__device__ __forceinline__ size_t columnwise_scale_offset_from_id(
+    const size_t tensor_id, const size_t rows, const size_t cols, const size_t num_tensors,
+    const bool has_first_dims, const int64_t *const __restrict__ offsets) {
+  const size_t scale_rows = columnwise_scale_rows_device(cols);
+  if (!has_first_dims) {
+    const size_t tensor_rows = rows / num_tensors;
+    return tensor_id * scale_rows * columnwise_scale_cols_device(tensor_rows);
+  }
+
+  size_t offset = 0;
+  for (size_t i = 0; i < tensor_id; ++i) {
+    const size_t tensor_rows =
+        (static_cast<size_t>(offsets[i + 1]) - static_cast<size_t>(offsets[i])) / cols;
+    offset += scale_rows * columnwise_scale_cols_device(tensor_rows);
+  }
+  return offset;
 }
 
 }  // namespace group_4over6
