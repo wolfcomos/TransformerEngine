@@ -21,8 +21,7 @@
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
 #include "../nvfp4/group_common_4over6_nvfp4.cuh"
-#include "../nvfp4/group_quantize_row_scaled_4over6_nvfp4.cuh"
-#include "../nvfp4/group_quantize_tensor_scaled_4over6_nvfp4.cuh"
+#include "../nvfp4/group_quantize_4over6_nvfp4.cuh"
 #include "../nvfp4/group_quantize_transpose_nvfp4.cuh"
 #include "../nvfp4/quantize_4over6_nvfp4.cuh"
 #include "../nvfp4/quantize_transpose_nvfp4.cuh"
@@ -493,8 +492,7 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
         nvfp4::group_quantize_row_scaled_4over6(input_view, &output_view, &quant_config_cpp,
                                                 stream);
       } else {
-        nvfp4::group_quantize_tensor_scaled_4over6(input_tensor, output_tensor,
-                                                   &quant_config_cpp, stream);
+        nvfp4::group_quantize_4over6(input_tensor, output_tensor, &quant_config_cpp, stream);
       }
       break;
     }

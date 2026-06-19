@@ -4,24 +4,12 @@
  * See LICENSE for license information.
  ************************************************************************/
 
-/*! \file group_quantize_row_scaled_4over6_nvfp4.cuh
- *  \brief Fused row-scaled NVFP4 4over6 grouped quantization.
- *
- *  The grouped row-scaled NVFP4 path stores all groups contiguously as a flat
- *  [total_rows, hidden] tensor and uses one global amax per row. The reference
- *  path runs two kernels: compute_rowwise_amax (one FP32 amax per row) followed
- *  by quantize_4over6 (per-1x16-block map-to-4 / map-to-6 candidate selection).
- *
- *  This header fuses both into a single launch with one CTA per row. The CTA
- *  first reduces the row amax, then evaluates the 4over6 candidates for every
- *  1x16 group using the exact same registers-only helpers as quantize_4over6.
- *  Because the per-row amax is a max of absolute values, it is order
- *  independent and bit-identical to compute_rowwise_amax, so the fused output
- *  matches the two-launch path exactly for rowwise data, scale_inv and amax.
+/*! \file group_quantize_4over6_nvfp4.cuh
+ *  \brief Grouped NVFP4 4over6 quantization, including row-scaled fused quantization.
  */
 
-#ifndef TRANSFORMER_ENGINE_GROUP_QUANTIZE_ROW_SCALED_4OVER6_NVFP4_CUH_
-#define TRANSFORMER_ENGINE_GROUP_QUANTIZE_ROW_SCALED_4OVER6_NVFP4_CUH_
+#ifndef TRANSFORMER_ENGINE_GROUP_QUANTIZE_4OVER6_NVFP4_CUH_
+#define TRANSFORMER_ENGINE_GROUP_QUANTIZE_4OVER6_NVFP4_CUH_
 
 #include <cuda.h>
 #include <cudaTypedefs.h>
@@ -35,6 +23,7 @@
 #include "../../util/math.h"
 #include "../../utils.cuh"
 #include "core_nvfp4.cuh"
+#include "group_common_4over6_nvfp4.cuh"
 #include "quantize_4over6_nvfp4.cuh"
 
 namespace transformer_engine {
@@ -43,12 +32,103 @@ namespace nvfp4 {
 
 #if FP4_TYPE_SUPPORTED
 
-namespace group_quantize_row_scaled_4over6_kernel {
+namespace group_quantize_4over6_kernel {
 
-// Reuse the registers-only 4over6 candidate helpers (compute_scale_pair,
-// make_candidates, select_scale, select_packed, store_packed_group, Config,
-// kGroupSize, kWarpThreads, kElementsPerHalfGroup, ScalePair, CandidatePair).
 using namespace quantize_4over6_kernel;
+
+constexpr int kThreads = 256;
+
+template <typename IType>
+__device__ __forceinline__ void load_global_row_group(const IType *input, const size_t row,
+                                                      const size_t cols, const size_t col,
+                                                      float (&x0)[8], float (&x1)[8],
+                                                      float *amax) {
+  Vec<IType, kElementsPerHalfGroup> x0_vec;
+  Vec<IType, kElementsPerHalfGroup> x1_vec;
+  const IType *base = input + row * cols + col;
+  x0_vec.load_from(base);
+  x1_vec.load_from(base + kElementsPerHalfGroup);
+
+  *amax = 0.0f;
+#pragma unroll
+  for (int i = 0; i < kElementsPerHalfGroup; ++i) {
+    const float v0 = static_cast<float>(x0_vec.data.elt[i]);
+    const float v1 = static_cast<float>(x1_vec.data.elt[i]);
+    x0[i] = v0;
+    x1[i] = v1;
+    *amax = fmaxf(*amax, fabsf(v0));
+    *amax = fmaxf(*amax, fabsf(v1));
+  }
+}
+
+template <typename Cfg, int E4M3_MAX, typename IType>
+__global__ void __launch_bounds__(kThreads)
+    group_quantize_4over6_kernel(
+        const IType *__restrict__ input, fp4e2m1x2 *__restrict__ output,
+        nvfp4_scale_t *__restrict__ scales, const float *__restrict__ amax,
+        const int64_t *__restrict__ offsets, const size_t rows, const size_t cols,
+        const size_t num_tensors, const size_t scale_stride, const bool has_first_dims,
+        const float *__restrict__ noop) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if (noop != nullptr && noop[0] == 1.0f) {
+    return;
+  }
+
+  const size_t groups_per_row = cols / kGroupSize;
+  const size_t group_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  const size_t row = group_idx / groups_per_row;
+  const size_t col_group = group_idx - row * groups_per_row;
+  if (row >= rows) {
+    return;
+  }
+  const size_t col = col_group * kGroupSize;
+  const size_t tensor_id =
+      group_4over6::tensor_id_from_row(row, rows, cols, num_tensors, has_first_dims, offsets);
+  const float global_amax = amax[tensor_id];
+
+  float x0[kElementsPerHalfGroup];
+  float x1[kElementsPerHalfGroup];
+  float block_amax = 0.0f;
+  load_global_row_group(input, row, cols, col, x0, x1, &block_amax);
+
+  const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, global_amax);
+  const CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
+
+  const bool pick_map4 = candidates.map4.err < candidates.map6.err;
+  const nvfp4_scale_t selected_scale = select_scale(scale_pair, pick_map4);
+  const uint32_t *selected = select_packed(candidates, pick_map4);
+
+  scales[row * scale_stride + col_group] = selected_scale;
+  store_packed_group(selected, &output[(row * cols + col) / 2]);
+#else
+  NVTE_DEVICE_ERROR("sm_100 or higher is required.");
+#endif
+}
+
+template <typename Cfg, int E4M3_MAX, typename IType>
+void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *output,
+                                  const Tensor *noop, cudaStream_t stream) {
+  const size_t rows = input->logical_shape.data[0];
+  const size_t cols = input->logical_shape.data[1];
+  if (rows == 0 || cols == 0) {
+    return;
+  }
+
+  const size_t groups = rows * (cols / kGroupSize);
+  const dim3 grid(static_cast<unsigned int>(DIVUP(groups, static_cast<size_t>(kThreads))));
+  const dim3 block(kThreads);
+  const auto *input_ptr = reinterpret_cast<const IType *>(input->data.dptr);
+  auto *output_ptr = reinterpret_cast<fp4e2m1x2 *>(output->data.dptr);
+  auto *scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output->scale_inv.dptr);
+  const auto *amax_ptr = reinterpret_cast<const float *>(output->amax.dptr);
+  const auto *offsets_ptr = reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr);
+  const auto *noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
+  const size_t scale_stride = group_4over6::rowwise_scale_cols(cols);
+
+  group_quantize_4over6_kernel<Cfg, E4M3_MAX, IType><<<grid, block, 0, stream>>>(
+      input_ptr, output_ptr, scales_ptr, amax_ptr, offsets_ptr, rows, cols, output->num_tensors,
+      scale_stride, output->first_dims.dptr != nullptr, noop_ptr);
+}
 
 // A group of WARPS_PER_ROW warps cooperates on one row; a fixed 256-thread CTA
 // (kFusedBlockWarps warps) therefore holds kFusedBlockWarps / WARPS_PER_ROW
@@ -62,7 +142,6 @@ using namespace quantize_4over6_kernel;
 constexpr int kFusedBlockWarps = 8;
 constexpr int kFusedThreads = kFusedBlockWarps * kWarpThreads;
 
-// Cached SM count, used to size WARPS_PER_ROW so a launch fills the device.
 inline int fused_multiprocessor_count() {
   static const int count = [] {
     int device = 0;
@@ -103,13 +182,9 @@ __global__ void __launch_bounds__(kFusedThreads)
   const int row_in_block = warp_id / WARPS_PER_ROW;
   const int row_thread = warp_in_row * kWarpThreads + lane;
   const size_t row = static_cast<size_t>(blockIdx.x) * kRowsPerBlock + row_in_block;
-  // Out-of-range rows in the last block stay resident (no early return) so the
-  // whole block still reaches the shared-memory barrier below; they merely skip
-  // every global load/store.
   const bool active = row < rows;
   const IType *row_in = input + (active ? row : 0) * cols;
 
-  // Pass 1: per-row amax (max of absolute values) across the row's threads.
   constexpr int kVecElems = 16 / sizeof(IType);
   const size_t num_vecs = cols / kVecElems;
   float thread_amax = 0.0f;
@@ -125,7 +200,6 @@ __global__ void __launch_bounds__(kFusedThreads)
   }
   float row_amax = warp_reduce_max_broadcast(thread_amax);
   if constexpr (WARPS_PER_ROW > 1) {
-    // Combine the per-warp maxima of each row through shared memory.
     __shared__ float row_amax_smem[kRowsPerBlock][WARPS_PER_ROW];
     if (lane == 0) {
       row_amax_smem[row_in_block][warp_in_row] = row_amax;
@@ -145,8 +219,6 @@ __global__ void __launch_bounds__(kFusedThreads)
     return;
   }
 
-  // Pass 2: 4over6 quantize each 1x16 group of the row using row_amax as the
-  // global amax (row-scaled NVFP4) and the per-group amax as the block amax.
   const size_t num_groups = cols / kGroupSize;
   for (size_t g = row_thread; g < num_groups; g += kRowThreads) {
     const size_t col = g * kGroupSize;
@@ -196,9 +268,6 @@ void launch_fused_row_scaled_4over6_one(const IType *input, fp4e2m1x2 *output,
       <<<grid, block, 0, stream>>>(input, output, scales, amax, rows, cols, scale_stride, noop);
 }
 
-// Raw-pointer launch entry point. Chooses WARPS_PER_ROW so the launch fills the
-// GPU (rows * WARPS_PER_ROW warps) without spawning pass-2-idle threads (capped
-// by the number of 1x16 groups), then dispatches the matching instantiation.
 template <typename Cfg, int E4M3_MAX, typename IType>
 void launch_fused_row_scaled_4over6(const IType *input, fp4e2m1x2 *output, nvfp4_scale_t *scales,
                                     float *amax, const float *noop, const size_t rows,
@@ -210,8 +279,6 @@ void launch_fused_row_scaled_4over6(const IType *input, fp4e2m1x2 *output, nvfp4
   const size_t num_groups = cols / kGroupSize;
   const size_t goal_warps = static_cast<size_t>(fused_multiprocessor_count()) * 64;
   int warps_per_row = 1;
-  // Grow warps/row (power of two, up to kFusedBlockWarps) while it both helps
-  // fill the device and still has at least one group of work per added thread.
   while (warps_per_row < kFusedBlockWarps &&
          rows * static_cast<size_t>(warps_per_row) < goal_warps &&
          static_cast<size_t>(warps_per_row) * 2 * kWarpThreads <= num_groups) {
@@ -237,7 +304,6 @@ void launch_fused_row_scaled_4over6(const IType *input, fp4e2m1x2 *output, nvfp4
   }
 }
 
-// Tensor-API overload used by the production dispatch path.
 template <typename Cfg, int E4M3_MAX, typename IType>
 void launch_fused_row_scaled_4over6(const Tensor &input, const Tensor *noop, Tensor *output,
                                     cudaStream_t stream) {
@@ -258,7 +324,7 @@ void launch_fused_row_scaled_4over6(const Tensor &input, const Tensor *noop, Ten
                                                        noop_ptr, rows, cols, scale_stride, stream);
 }
 
-}  // namespace group_quantize_row_scaled_4over6_kernel
+}  // namespace group_quantize_4over6_kernel
 
 #endif  // FP4_TYPE_SUPPORTED
 
@@ -270,7 +336,7 @@ inline void group_quantize_row_scaled_4over6(const Tensor &input, Tensor *output
                                              cudaStream_t stream) {
 #if FP4_TYPE_SUPPORTED
   using namespace quantize_4over6_kernel;
-  using namespace group_quantize_row_scaled_4over6_kernel;
+  using namespace group_quantize_4over6_kernel;
 
   checkCuDriverContext(stream);
   CheckInputTensor(input, "input");
@@ -315,9 +381,92 @@ inline void group_quantize_row_scaled_4over6(const Tensor &input, Tensor *output
                 using Cfg = quantize_4over6_kernel::Config<MODE, ERR_USE_FAST_MATH>;
                 TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
                     input.dtype(), IType,
-                    group_quantize_row_scaled_4over6_kernel::launch_fused_row_scaled_4over6<
-                        Cfg, E4M3_MAX, IType>(
+                    launch_fused_row_scaled_4over6<Cfg, E4M3_MAX, IType>(
                         input, noop, output, stream););
+              });););
+
+  NVTE_CHECK_CUDA(cudaGetLastError());
+#else
+  NVTE_ERROR("FP4 support requires CUDA 12.8+, but compile-time CUDA version is ", CUDA_VERSION);
+#endif  // FP4_TYPE_SUPPORTED
+}
+
+inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *output,
+                                  const QuantizationConfig *quant_config, cudaStream_t stream) {
+#if FP4_TYPE_SUPPORTED
+  using namespace group_quantize_4over6_kernel;
+  using namespace quantize_4over6_kernel;
+
+  checkCuDriverContext(stream);
+  NVTE_CHECK(input->num_tensors == output->num_tensors,
+             "Number of input and output tensors must be same.");
+  NVTE_CHECK(quant_config != nullptr &&
+                 quant_config->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled,
+             "Grouped NVFP4 4over6 quantization requires a non-disabled 4over6 mode.");
+  NVTE_CHECK(!quant_config->nvfp4_2d_quantization,
+             "Grouped NVFP4 4over6 quantization currently supports 1D rowwise quantization only.");
+  NVTE_CHECK(!quant_config->stochastic_rounding,
+             "Grouped NVFP4 4over6 quantization does not support stochastic rounding.");
+  NVTE_CHECK(!output->row_scaled_nvfp4,
+             "Use group_quantize_row_scaled_4over6 for row-scaled grouped 4over6.");
+  NVTE_CHECK(input->has_data(), "Grouped NVFP4 4over6 quantization requires rowwise input data.");
+  NVTE_CHECK(output->has_data(), "Grouped NVFP4 4over6 quantization requires rowwise output data.");
+  NVTE_CHECK(!output->has_columnwise_data(),
+             "Grouped NVFP4 4over6 quantization currently does not support columnwise output.");
+  NVTE_CHECK(!output->with_gemm_swizzled_scales,
+             "Grouped NVFP4 4over6 quantization requires compact scale layout.");
+
+  const auto logical_shape = group_4over6::logical_shape_2d(*input, "Grouped quantize input");
+  NVTE_CHECK(output->logical_shape.ndim == 2 &&
+                 output->logical_shape.data[0] == logical_shape[0] &&
+                 output->logical_shape.data[1] == logical_shape[1],
+             "Grouped NVFP4 4over6 input and output logical shapes must match.");
+  const size_t rows = logical_shape[0];
+  const size_t cols = logical_shape[1];
+  const auto scale_shape = group_4over6::rowwise_scale_shape(rows, cols);
+
+  NVTE_CHECK(input->data.numel() == rows * cols,
+             "Grouped NVFP4 4over6 input rowwise data has wrong size.");
+  NVTE_CHECK(output->data.numel() == rows * cols / 2,
+             "Grouped NVFP4 4over6 output rowwise data has wrong packed size.");
+  NVTE_CHECK(output->scale_inv.dptr != nullptr,
+             "Grouped NVFP4 4over6 quantization requires rowwise scale_inv.");
+  NVTE_CHECK(output->scale_inv.dtype == DType::kFloat8E4M3,
+             "Grouped NVFP4 4over6 scale_inv must have Float8E4M3 dtype.");
+  NVTE_CHECK(output->scale_inv.numel() == product(scale_shape),
+             "Grouped NVFP4 4over6 scale_inv has wrong size.");
+  NVTE_CHECK(output->amax.dptr != nullptr,
+             "Grouped NVFP4 4over6 quantization requires per-tensor amax.");
+  NVTE_CHECK(output->amax.numel() == output->num_tensors,
+             "Grouped NVFP4 4over6 quantization requires one amax per tensor.");
+
+  const ShapeRepresentation shape_rep = group_4over6::shape_representation(*output);
+  NVTE_CHECK(shape_rep == ShapeRepresentation::SAME_BOTH_DIMS ||
+                 shape_rep == ShapeRepresentation::VARYING_FIRST_DIM,
+             "Grouped NVFP4 4over6 quantization currently requires a constant last dimension.");
+  NVTE_CHECK(shape_rep != ShapeRepresentation::SAME_BOTH_DIMS || rows % output->num_tensors == 0,
+             "Grouped NVFP4 4over6 quantization requires rows divisible by num_tensors when "
+             "first_dims are not provided.");
+  NVTE_CHECK(shape_rep != ShapeRepresentation::VARYING_FIRST_DIM || output->tensor_offsets.dptr,
+             "Grouped NVFP4 4over6 quantization requires tensor_offsets for varying first dims.");
+
+  Tensor dummy_tensor;
+  const Tensor *noop = &dummy_tensor;
+  if (quant_config->noop_tensor != nullptr) {
+    noop = convertNVTETensorCheck(quant_config->noop_tensor);
+  }
+
+  TRANSFORMER_ENGINE_NVFP4_4OVER6_E4M3_MAX_SWITCH(
+      output->nvfp4_e4m3_max, E4M3_MAX,
+      TRANSFORMER_ENGINE_NVFP4_4OVER6_MODE_SWITCH(
+          quant_config->nvfp4_4over6_mode, MODE,
+          TRANSFORMER_ENGINE_SWITCH_CONDITION(
+              quant_config->nvfp4_4over6_err_use_fast_math, ERR_USE_FAST_MATH, {
+                using Cfg = quantize_4over6_kernel::Config<MODE, ERR_USE_FAST_MATH>;
+                TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
+                    input->dtype(), IType,
+                    launch_group_quantize_4over6<Cfg, E4M3_MAX, IType>(
+                        input, output, noop, stream););
               });););
 
   NVTE_CHECK_CUDA(cudaGetLastError());
@@ -330,4 +479,4 @@ inline void group_quantize_row_scaled_4over6(const Tensor &input, Tensor *output
 }  // namespace dispatch
 }  // namespace transformer_engine
 
-#endif  // TRANSFORMER_ENGINE_GROUP_QUANTIZE_ROW_SCALED_4OVER6_NVFP4_CUH_
+#endif  // TRANSFORMER_ENGINE_GROUP_QUANTIZE_4OVER6_NVFP4_CUH_
