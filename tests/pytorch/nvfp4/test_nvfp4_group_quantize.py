@@ -45,78 +45,12 @@ from test_nvfp4_quantize_exact import (
 recipe_available, reason_for_no_recipe = te.is_nvfp4_available(return_reason=True)
 
 
-@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
-@pytest.mark.parametrize("use_4over6", [True], ids=["4over6"])
-def test_row_scaled_group_quantize_matches_flat_quantize(use_4over6: bool) -> None:
-    """Grouped row-scaled NVFP4 (4over6) should match the flat Tensor quant/dequant
-    path. Grouped row-scaled quant is only supported with a 4over6 mode."""
-
-    device = "cuda"
-    torch.manual_seed(0)
-    torch.cuda.manual_seed(0)
-
-    M, N = 256, 512
-    num_tensors = 2
-    split_sections = torch.tensor([128, 128], dtype=torch.int64, device=device)
-    x = torch.randn((M, N), dtype=torch.bfloat16, device=device)
-
-    quantizer = NVFP4Quantizer(
-        fp4_dtype=te.DType.kFloat4E2M1,
-        rowwise=True,
-        columnwise=False,
-        with_amax_reduction=False,
-        amax_reduction_group=None,
-        with_rht=False,
-        with_post_rht_amax=False,
-        with_2d_quantization=False,
-        stochastic_rounding=False,
-        row_scaled_nvfp4=True,
-        nvfp4_use_4over6=use_4over6,
-        nvfp4_e4m3_max=256 if use_4over6 else 448,
-        nvfp4_4over6_err_mode="MAE",
-    )
-
-    grouped = tex.group_quantize(x, quantizer, num_tensors, split_sections)
-    flat = quantizer(x)
-
-    torch.testing.assert_close(
-        grouped.rowwise_data,
-        flat._rowwise_data.view(dtype=torch.uint8).reshape(-1),
-        atol=0,
-        rtol=0,
-    )
-    torch.testing.assert_close(
-        grouped.scale_inv,
-        flat._rowwise_scale_inv.reshape(-1),
-        atol=0,
-        rtol=0,
-    )
-    torch.testing.assert_close(grouped.amax, flat._amax_rowwise, atol=0, rtol=0)
-
-    grouped_dequantized = tex.group_dequantize(grouped, te.DType.kBFloat16)
-    flat_dequantized = tex.dequantize(flat, te.DType.kBFloat16)
-    torch.testing.assert_close(
-        grouped_dequantized.rowwise_data.reshape(M, N),
-        flat_dequantized,
-        atol=0,
-        rtol=0,
-    )
-
-
 def _roundup(value: int, multiple: int) -> int:
     return ((value + multiple - 1) // multiple) * multiple
 
 
 def _valid_rowwise_scale_bytes(grouped, total_rows: int, hidden: int) -> torch.Tensor:
-    """Slice the written region out of the padded compact E4M3 scale buffer.
-
-    The grouped rowwise scale buffer is a single padded block of shape
-    ``[roundup(total_rows, 128), roundup(hidden / 16, 4)]`` (see
-    ``NVFP4Quantizer::get_scale_shape``). Only ``[total_rows, hidden / 16]`` is
-    written; the trailing rows/cols are padding that neither path touches, so
-    they hold nondeterministic allocation garbage and must be excluded from a
-    byte comparison.
-    """
+    """Slice written bytes out of the padded compact E4M3 scale buffer."""
     sinv0 = _roundup(total_rows, 128)
     sinv1 = _roundup(hidden // 16, 4)
     flat = grouped.scale_inv.contiguous().view(torch.uint8).reshape(-1)
@@ -125,30 +59,13 @@ def _valid_rowwise_scale_bytes(grouped, total_rows: int, hidden: int) -> torch.T
     return block[:total_rows, : hidden // 16].reshape(-1).clone()
 
 
-def _make_row_scaled_4over6_quantizer(err_mode: str, nvfp4_e4m3_max: int) -> NVFP4Quantizer:
-    return NVFP4Quantizer(
-        fp4_dtype=te.DType.kFloat4E2M1,
-        rowwise=True,
-        columnwise=False,
-        with_amax_reduction=False,
-        amax_reduction_group=None,
-        with_rht=False,
-        with_post_rht_amax=False,
-        with_2d_quantization=False,
-        stochastic_rounding=False,
-        row_scaled_nvfp4=True,
-        nvfp4_use_4over6=True,
-        nvfp4_e4m3_max=nvfp4_e4m3_max,
-        nvfp4_4over6_err_mode=err_mode,
-    )
-
-
 def _make_4over6_quantizer(
     err_mode: str,
     nvfp4_e4m3_max: int,
     *,
     rowwise: bool = True,
     columnwise: bool = False,
+    row_scaled: bool = False,
 ) -> NVFP4Quantizer:
     return NVFP4Quantizer(
         fp4_dtype=te.DType.kFloat4E2M1,
@@ -160,7 +77,7 @@ def _make_4over6_quantizer(
         with_post_rht_amax=False,
         with_2d_quantization=False,
         stochastic_rounding=False,
-        row_scaled_nvfp4=False,
+        row_scaled_nvfp4=row_scaled,
         nvfp4_use_4over6=True,
         nvfp4_e4m3_max=nvfp4_e4m3_max,
         nvfp4_4over6_err_mode=err_mode,
@@ -178,7 +95,7 @@ def _dequantize_columnwise_ref(ref, rows: int, hidden: int, e4m3_max: int) -> to
     return dequantized_t.t().contiguous().to(torch.bfloat16)
 
 
-def _assert_regular_4over6_grouped_rowwise_matches_flat(
+def _assert_rowwise_matches_per_tensor(
     grouped,
     refs: list,
     expected_amax: torch.Tensor,
@@ -225,7 +142,7 @@ def _assert_regular_4over6_grouped_rowwise_matches_flat(
     )
 
 
-def _assert_regular_4over6_grouped_columnwise_matches_flat(
+def _assert_columnwise_matches_per_tensor(
     grouped,
     refs: list,
     expected_amax: torch.Tensor,
@@ -305,6 +222,31 @@ def _assert_regular_4over6_grouped_columnwise_matches_flat(
 _ROW_SCALED_4OVER6_CONFIGS = [cfg for cfg in NVFP4_4OVER6_CONFIGS if cfg.use_4over6]
 
 
+# Fused row-scaled 4over6 grouped path.
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+def test_row_scaled_4over6_group_dequantize_matches_flat() -> None:
+    """Grouped row-scaled NVFP4 dequant should match the flat quant/dequant path."""
+
+    device = "cuda"
+    torch.manual_seed(0)
+    torch.cuda.manual_seed(0)
+
+    rows, hidden = 256, 512
+    splits = [128, 128]
+    split_sections = torch.tensor(splits, dtype=torch.int64, device=device)
+    x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
+    quantizer = _make_4over6_quantizer("MAE", 256, row_scaled=True)
+
+    grouped = tex.group_quantize(x, quantizer, len(splits), split_sections)
+    flat = quantizer(x)
+    torch.testing.assert_close(
+        tex.group_dequantize(grouped, te.DType.kBFloat16).rowwise_data.reshape(rows, hidden),
+        tex.dequantize(flat, te.DType.kBFloat16),
+        atol=0,
+        rtol=0,
+    )
+
+
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
 @pytest.mark.parametrize(
     "rows, hidden, splits",
@@ -319,16 +261,10 @@ _ROW_SCALED_4OVER6_CONFIGS = [cfg for cfg in NVFP4_4OVER6_CONFIGS if cfg.use_4ov
 @pytest.mark.parametrize(
     "cfg", _ROW_SCALED_4OVER6_CONFIGS, ids=[cfg.id for cfg in _ROW_SCALED_4OVER6_CONFIGS]
 )
-def test_row_scaled_4over6_group_quantize_versus_reference(
+def test_row_scaled_4over6_group_quantize_matches_reference(
     rows: int, hidden: int, splits: list[int], cfg
 ) -> None:
-    """The fused single-launch row-scaled 4over6 grouped kernel must be byte-exact
-    against the PyTorch reference (``NVFP4QuantizerRef``), the same contract that
-    ``test_nvfp4_quantize_exact`` enforces for the flat path.
-
-    Row-scaled 4over6 is purely per-row (no cross-group dependency), so the flat
-    ``[total_rows, hidden]`` reference quantization is the expected grouped result.
-    """
+    """Grouped row-scaled 4over6 should match the PyTorch reference."""
     assert sum(splits) == rows and rows % 16 == 0 and hidden % 16 == 0
 
     device = "cuda"
@@ -337,14 +273,11 @@ def test_row_scaled_4over6_group_quantize_versus_reference(
 
     x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
     first_dims = torch.tensor(splits, dtype=torch.int64, device=device)
-    quantizer = _make_row_scaled_4over6_quantizer(cfg.err_mode, cfg.e4m3_max)
+    quantizer = _make_4over6_quantizer(cfg.err_mode, cfg.e4m3_max, row_scaled=True)
 
-    # System under test: the fused grouped row-scaled 4over6 kernel. The error
-    # fast-math env is read live by the C++ adapter on each call.
     with nvfp4_4over6_err_fast_math(cfg.err_use_fast_math):
         grouped = tex.group_quantize(x, quantizer, len(splits), first_dims)
 
-    # Reference: NVFP4QuantizerRef on the flat input (per-row, no cross-group dep).
     ref_quantizer = NVFP4QuantizerRef(
         dtype=utils.Fp4Formats.E2M1,
         rowwise=True,
@@ -360,12 +293,10 @@ def test_row_scaled_4over6_group_quantize_versus_reference(
     )
     x_ref = ref_quantizer.quantize(x)
 
-    # Packed FP4 data (compare unpacked nibbles).
     qx = unpack_fp4(grouped.rowwise_data.view(dtype=torch.uint8).reshape(rows, hidden // 2))
     qx_ref = unpack_fp4(x_ref.data.view(dtype=torch.uint8))
     torch.testing.assert_close(qx, qx_ref, atol=0.0, rtol=0.0)
 
-    # Compact E4M3 scales: compare only the written (non-padding) region.
     sx_ref = x_ref.scale.view(dtype=torch.uint8)
     torch.testing.assert_close(
         _valid_rowwise_scale_bytes(grouped, rows, hidden),
@@ -374,81 +305,36 @@ def test_row_scaled_4over6_group_quantize_versus_reference(
         rtol=0.0,
     )
 
-    # Per-row FP32 amax.
     torch.testing.assert_close(
         grouped.amax.reshape(-1), x_ref.global_amax_row.reshape(-1), atol=0.0, rtol=0.0
     )
 
 
-@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
-def test_non_row_scaled_4over6_group_quantize_with_amax_versus_flat() -> None:
-    """Grouped non-row-scaled 4over6 uses per-tensor amax and native grouped dequant."""
-
-    device = "cuda"
-    torch.manual_seed(5678)
-    torch.cuda.manual_seed(5678)
-
-    rows, hidden = 384, 512
-    splits = [128, 256]
-    first_dims = torch.tensor(splits, dtype=torch.int64, device=device)
-    x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
-    x_chunks = torch.split(x, splits)
-    quantizer = _make_4over6_quantizer("MAE", 448)
-
-    rowwise_amax = torch.stack([chunk.abs().amax().float() for chunk in x_chunks])
-    columnwise_amax = rowwise_amax.clone()
-
-    with nvfp4_4over6_err_fast_math(False):
-        grouped = tex.nvfp4_group_quantize_with_amax(
-            x, quantizer, len(splits), first_dims, rowwise_amax, columnwise_amax
-        )
-        refs = [quantizer(chunk) for chunk in x_chunks]
-
-    _assert_regular_4over6_grouped_rowwise_matches_flat(
-        grouped, refs, rowwise_amax, splits, rows, hidden
-    )
-
-
-@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
-def test_non_row_scaled_4over6_group_quantize_computes_amax_versus_flat() -> None:
-    """Grouped non-row-scaled 4over6 computes per-tensor amax before native quantize."""
-
-    device = "cuda"
-    torch.manual_seed(8765)
-    torch.cuda.manual_seed(8765)
-
-    rows, hidden = 384, 512
-    splits = [128, 256]
-    first_dims = torch.tensor(splits, dtype=torch.int64, device=device)
-    x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
-    x_chunks = torch.split(x, splits)
-    quantizer = _make_4over6_quantizer("MAE", 448)
-
-    expected_amax = torch.stack([chunk.abs().amax().float() for chunk in x_chunks])
-
-    with nvfp4_4over6_err_fast_math(False):
-        grouped = tex.group_quantize(x, quantizer, len(splits), first_dims)
-        refs = [quantizer(chunk) for chunk in x_chunks]
-
-    _assert_regular_4over6_grouped_rowwise_matches_flat(
-        grouped, refs, expected_amax, splits, rows, hidden
-    )
-
-
+# Regular 4over6 grouped quant/dequant path.
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
 @pytest.mark.parametrize(
-    "compute_amax, quantize_mode",
+    "compute_amax, quantize_mode, precomputed_offsets",
     [
-        (False, "columnwise_only"),
-        (False, "both_directions"),
-        (True, "both_directions"),
+        (False, "rowwise_only", False),
+        (True, "rowwise_only", False),
+        (False, "columnwise_only", False),
+        (False, "both_directions", False),
+        (True, "both_directions", False),
+        (False, "both_directions", True),
     ],
-    ids=["with_amax_columnwise_only", "with_amax_both_directions", "compute_amax_both_directions"],
+    ids=[
+        "with_amax_rowwise_only",
+        "compute_amax_rowwise_only",
+        "with_amax_columnwise_only",
+        "with_amax_both_directions",
+        "compute_amax_both_directions",
+        "precomputed_offsets",
+    ],
 )
-def test_non_row_scaled_4over6_group_quantize_columnwise_versus_flat(
-    compute_amax: bool, quantize_mode: str
+def test_regular_4over6_group_quantize_matches_per_tensor(
+    compute_amax: bool, quantize_mode: str, precomputed_offsets: bool
 ) -> None:
-    """Grouped non-row-scaled 4over6 supports columnwise output through native grouped kernels."""
+    """Grouped regular 4over6 quantization should match per-tensor quantization."""
 
     device = "cuda"
     torch.manual_seed(9876)
@@ -457,11 +343,21 @@ def test_non_row_scaled_4over6_group_quantize_columnwise_versus_flat(
     rows, hidden = 384, 512
     splits = [128, 256]
     first_dims = torch.tensor(splits, dtype=torch.int64, device=device)
+    tensor_offsets = None
+    if precomputed_offsets:
+        first_dims, (tensor_offsets,) = tex.splits_to_offsets_multi(
+            first_dims,
+            torch.device(device),
+            strides=[hidden],
+            include_leading_zero=[True],
+            dtypes=[torch.int64],
+        )
     x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
     x_chunks = torch.split(x, splits)
-    return_rowwise = quantize_mode == "both_directions"
+    return_rowwise = quantize_mode != "columnwise_only"
+    return_columnwise = quantize_mode != "rowwise_only"
     quantizer = _make_4over6_quantizer(
-        "MAE", 448, rowwise=return_rowwise, columnwise=True
+        "MAE", 448, rowwise=return_rowwise, columnwise=return_columnwise
     )
 
     expected_amax = torch.stack([chunk.abs().amax().float() for chunk in x_chunks])
@@ -471,17 +367,26 @@ def test_non_row_scaled_4over6_group_quantize_columnwise_versus_flat(
             grouped = tex.group_quantize(x, quantizer, len(splits), first_dims)
         else:
             grouped = tex.nvfp4_group_quantize_with_amax(
-                x, quantizer, len(splits), first_dims, expected_amax, expected_amax
+                x,
+                quantizer,
+                len(splits),
+                first_dims,
+                expected_amax,
+                expected_amax,
+                tensor_offsets=tensor_offsets,
             )
         refs = [quantizer(chunk) for chunk in x_chunks]
 
+    if tensor_offsets is not None:
+        assert grouped.tensor_offsets.data_ptr() == tensor_offsets.data_ptr()
     if return_rowwise:
-        _assert_regular_4over6_grouped_rowwise_matches_flat(
+        _assert_rowwise_matches_per_tensor(
             grouped, refs, expected_amax, splits, rows, hidden
         )
-    _assert_regular_4over6_grouped_columnwise_matches_flat(
-        grouped, refs, expected_amax, splits, rows, hidden, 448
-    )
+    if return_columnwise:
+        _assert_columnwise_matches_per_tensor(
+            grouped, refs, expected_amax, splits, rows, hidden, 448
+        )
 
 
 def check_group_quantization_nvfp4_versus_reference(
