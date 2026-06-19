@@ -318,10 +318,10 @@ __global__ void __launch_bounds__(kFusedThreads)
 }
 
 template <int WARPS_PER_ROW, typename Cfg, int E4M3_MAX, typename IType>
-void launch_fused_row_scaled_4over6_one(const IType *input, fp4e2m1x2 *output,
-                                        nvfp4_scale_t *scales, float *amax, const float *noop,
-                                        const size_t rows, const size_t cols,
-                                        const size_t scale_stride, cudaStream_t stream) {
+void launch_fused_row_scaled_4over6_kernel(const IType *input, fp4e2m1x2 *output,
+                                           nvfp4_scale_t *scales, float *amax, const float *noop,
+                                           const size_t rows, const size_t cols,
+                                           const size_t scale_stride, cudaStream_t stream) {
   constexpr int kRowsPerBlock = kFusedBlockWarps / WARPS_PER_ROW;
   const dim3 grid(static_cast<unsigned int>(DIVUP(rows, static_cast<size_t>(kRowsPerBlock))));
   const dim3 block(kFusedThreads);
@@ -347,19 +347,19 @@ void launch_fused_row_scaled_4over6(const IType *input, fp4e2m1x2 *output, nvfp4
   }
   switch (warps_per_row) {
     case 8:
-      launch_fused_row_scaled_4over6_one<8, Cfg, E4M3_MAX, IType>(
+      launch_fused_row_scaled_4over6_kernel<8, Cfg, E4M3_MAX, IType>(
           input, output, scales, amax, noop, rows, cols, scale_stride, stream);
       break;
     case 4:
-      launch_fused_row_scaled_4over6_one<4, Cfg, E4M3_MAX, IType>(
+      launch_fused_row_scaled_4over6_kernel<4, Cfg, E4M3_MAX, IType>(
           input, output, scales, amax, noop, rows, cols, scale_stride, stream);
       break;
     case 2:
-      launch_fused_row_scaled_4over6_one<2, Cfg, E4M3_MAX, IType>(
+      launch_fused_row_scaled_4over6_kernel<2, Cfg, E4M3_MAX, IType>(
           input, output, scales, amax, noop, rows, cols, scale_stride, stream);
       break;
     default:
-      launch_fused_row_scaled_4over6_one<1, Cfg, E4M3_MAX, IType>(
+      launch_fused_row_scaled_4over6_kernel<1, Cfg, E4M3_MAX, IType>(
           input, output, scales, amax, noop, rows, cols, scale_stride, stream);
       break;
   }
