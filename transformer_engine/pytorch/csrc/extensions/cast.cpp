@@ -593,12 +593,6 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
     } else if (py::hasattr(input, "_row_scaled_nvfp4")) {
       row_scaled_nvfp4 = input.attr("_row_scaled_nvfp4").cast<bool>();
     }
-    bool nvfp4_use_4over6 = false;
-    if (py::hasattr(input, "nvfp4_use_4over6")) {
-      nvfp4_use_4over6 = input.attr("nvfp4_use_4over6").cast<bool>();
-    } else if (py::hasattr(input, "_nvfp4_use_4over6")) {
-      nvfp4_use_4over6 = input.attr("_nvfp4_use_4over6").cast<bool>();
-    }
     bool with_gemm_swizzled_scales = false;
     if (py::hasattr(input, "with_gemm_swizzled_scales")) {
       with_gemm_swizzled_scales = input.attr("with_gemm_swizzled_scales").cast<bool>();
@@ -612,8 +606,6 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
       nvfp4_e4m3_max = input.attr("_nvfp4_e4m3_max").cast<int>();
     }
 
-    NVTE_CHECK(nvfp4_use_4over6,
-               "Grouped NVFP4 dequantize is currently supported only for 4over6 recipe tensors.");
     input_cpp.set_with_gemm_swizzled_scales(with_gemm_swizzled_scales);
     input_cpp.set_row_scaled_nvfp4(row_scaled_nvfp4);
     input_cpp.set_nvfp4_e4m3_max(nvfp4_e4m3_max);

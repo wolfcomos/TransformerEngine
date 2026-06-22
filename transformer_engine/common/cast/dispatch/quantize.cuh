@@ -20,7 +20,6 @@
 #include "../fp8/quantize_fp8.cuh"
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
-#include "../nvfp4/group_common_4over6_nvfp4.cuh"
 #include "../nvfp4/group_quantize_4over6_nvfp4.cuh"
 #include "../nvfp4/group_quantize_transpose_nvfp4.cuh"
 #include "../nvfp4/quantize_4over6_nvfp4.cuh"

@@ -18,7 +18,6 @@
 #include "../mxfp8/dequantize_mxfp8.cuh"
 #include "../mxfp8/group_dequantize_mxfp8.cuh"
 #include "../nvfp4/dequantize_nvfp4.cuh"
-#include "../nvfp4/group_dequantize_4over6_nvfp4.cuh"
 
 namespace transformer_engine {
 namespace dispatch {
@@ -68,10 +67,6 @@ inline void group_dequantize_helper(const GroupedTensor &input, GroupedTensor *o
       } else {
         NVTE_ERROR("MXFP8 Grouped Dequantization is NOT supported by architectures < 10.0");
       }
-      break;
-    }
-    case NVTE_NVFP4_1D_SCALING: {
-      nvfp4::group_dequantize_4over6(&input, output, stream);
       break;
     }
     default:
