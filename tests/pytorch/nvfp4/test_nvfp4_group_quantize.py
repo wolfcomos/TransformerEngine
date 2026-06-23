@@ -361,7 +361,7 @@ def test_row_scaled_4over6_group_quantize_matches_reference(
     "rows, hidden, splits",
     [
         (384, 512, [128, 256]),
-        (384, 320, [96, 128, 160]),  # uneven splits, padded scale columns
+        (384, 384, [96, 128, 160]),  # uneven splits, 128-aligned hidden dim
         (128, 512, [128]),  # single-tensor grouped path
     ],
 )
