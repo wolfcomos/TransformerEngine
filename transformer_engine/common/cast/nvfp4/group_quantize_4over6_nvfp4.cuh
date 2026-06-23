@@ -385,6 +385,7 @@ void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
 
 constexpr int kFusedBlockWarps = 8;
 constexpr int kFusedThreads = kFusedBlockWarps * kWarpThreads;
+constexpr int kFusedWarpsPerRow = 1;
 
 template <int WARPS_PER_ROW, typename Cfg, int E4M3_MAX, typename IType>
 __global__ void __launch_bounds__(kFusedThreads)
@@ -475,18 +476,6 @@ __global__ void __launch_bounds__(kFusedThreads)
 #endif
 }
 
-template <int WARPS_PER_ROW, typename Cfg, int E4M3_MAX, typename IType>
-void launch_fused_row_scaled_4over6_kernel(const IType *input, fp4e2m1x2 *output,
-                                           nvfp4_scale_t *scales, float *amax, const float *noop,
-                                           const size_t rows, const size_t cols,
-                                           const size_t scale_stride, cudaStream_t stream) {
-  constexpr int kRowsPerBlock = kFusedBlockWarps / WARPS_PER_ROW;
-  const dim3 grid(static_cast<unsigned int>(DIVUP(rows, static_cast<size_t>(kRowsPerBlock))));
-  const dim3 block(kFusedThreads);
-  fused_row_scaled_4over6_kernel<WARPS_PER_ROW, Cfg, E4M3_MAX, IType>
-      <<<grid, block, 0, stream>>>(input, output, scales, amax, rows, cols, scale_stride, noop);
-}
-
 template <typename Cfg, int E4M3_MAX, typename IType>
 void launch_fused_row_scaled_4over6(const IType *input, fp4e2m1x2 *output, nvfp4_scale_t *scales,
                                     float *amax, const float *noop, const size_t rows,
@@ -495,32 +484,11 @@ void launch_fused_row_scaled_4over6(const IType *input, fp4e2m1x2 *output, nvfp4
   if (rows == 0 || cols == 0) {
     return;
   }
-  const size_t num_groups = cols / kGroupSize;
-  const size_t goal_warps = static_cast<size_t>(transformer_engine::cuda::sm_count()) * 64;
-  int warps_per_row = 1;
-  while (warps_per_row < kFusedBlockWarps &&
-         rows * static_cast<size_t>(warps_per_row) < goal_warps &&
-         static_cast<size_t>(warps_per_row) * 2 * kWarpThreads <= num_groups) {
-    warps_per_row *= 2;
-  }
-  switch (warps_per_row) {
-    case 8:
-      launch_fused_row_scaled_4over6_kernel<8, Cfg, E4M3_MAX, IType>(
-          input, output, scales, amax, noop, rows, cols, scale_stride, stream);
-      break;
-    case 4:
-      launch_fused_row_scaled_4over6_kernel<4, Cfg, E4M3_MAX, IType>(
-          input, output, scales, amax, noop, rows, cols, scale_stride, stream);
-      break;
-    case 2:
-      launch_fused_row_scaled_4over6_kernel<2, Cfg, E4M3_MAX, IType>(
-          input, output, scales, amax, noop, rows, cols, scale_stride, stream);
-      break;
-    default:
-      launch_fused_row_scaled_4over6_kernel<1, Cfg, E4M3_MAX, IType>(
-          input, output, scales, amax, noop, rows, cols, scale_stride, stream);
-      break;
-  }
+  constexpr int kRowsPerBlock = kFusedBlockWarps / kFusedWarpsPerRow;
+  const dim3 grid(static_cast<unsigned int>(DIVUP(rows, static_cast<size_t>(kRowsPerBlock))));
+  const dim3 block(kFusedThreads);
+  fused_row_scaled_4over6_kernel<kFusedWarpsPerRow, Cfg, E4M3_MAX, IType>
+      <<<grid, block, 0, stream>>>(input, output, scales, amax, rows, cols, scale_stride, noop);
 }
 
 template <typename Cfg, int E4M3_MAX, typename IType>

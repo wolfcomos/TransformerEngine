@@ -63,19 +63,6 @@ RECIPES = {
     "fp8_sub_channel": Float8BlockScaling(),
     "mxfp8": MXFP8BlockScaling(),
     "nvfp4": NVFP4BlockScaling(),
-    "nvfp4_4over6": NVFP4BlockScaling(
-        disable_rht=True,
-        disable_stochastic_rounding=True,
-        nvfp4_4over6="all",
-    ),
-    "nvfp4_4over6_row_scaled": NVFP4BlockScaling(
-        disable_rht=True,
-        disable_stochastic_rounding=True,
-        disable_2d_quantization=True,
-        row_scaled_activation=True,
-        nvfp4_4over6="all",
-        backward_override="high_precision",
-    ),
 }
 
 mxfp8_available, reason_for_no_mxfp8 = FP8GlobalStateManager.is_mxfp8_available()
@@ -259,13 +246,12 @@ if __name__ == "__main__":
         default="benchmark_output/",
         help="output path for report",
     )
-    # arguments for recipe, options are fp8_sub_channel, mxfp8, nvfp4, bf16, all
+    # arguments for recipe, options are fp8_sub_channel, mxfp8, bf16, all
     parser.add_argument(
         "--recipe",
         type=str,
         default="bf16",
-        help="Recipe to use, options are fp8_sub_channel, mxfp8, nvfp4, nvfp4_4over6,"
-        " nvfp4_4over6_row_scaled, bf16, or all",
+        help="Recipe to use, options are fp8_sub_channel, mxfp8, bf16, or all",
     )
     # add an argument for the jagged input
     # example: [15296, 8960, 14656, 14784, 11712, 7936, 14080, 10880] => sums up to 98304
@@ -349,14 +335,7 @@ if __name__ == "__main__":
     recipe_list = ["bf16"]
 
     if args.recipe == "all":
-        recipe_list = [
-            "bf16",
-            "fp8_sub_channel",
-            "mxfp8",
-            "nvfp4",
-            "nvfp4_4over6",
-            "nvfp4_4over6_row_scaled",
-        ]
+        recipe_list = ["bf16", "fp8_sub_channel", "mxfp8", "nvfp4"]
     else:
         recipe_list = [args.recipe]
 
@@ -372,7 +351,7 @@ if __name__ == "__main__":
         # in profile mode, only run one recipe specified in args.recipe
         assert args.recipe != "all", (
             "In profile mode, only one recipe can be specified, please specify the recipe as"
-            " fp8_sub_channel, mxfp8, nvfp4, nvfp4_4over6, nvfp4_4over6_row_scaled, or bf16"
+            " fp8_sub_channel, mxfp8, nvfp4, or bf16"
         )
         recipe_list = [args.recipe]
         torch.autograd.profiler.emit_nvtx(record_shapes=True).__enter__()
@@ -389,19 +368,14 @@ if __name__ == "__main__":
                 "fp8_sub_channel",
                 "mxfp8",
                 "nvfp4",
-                "nvfp4_4over6",
-                "nvfp4_4over6_row_scaled",
-            ], (
-                "Recipe must be one of bf16, fp8_sub_channel, mxfp8, nvfp4, nvfp4_4over6, "
-                "or nvfp4_4over6_row_scaled"
-            )
+            ], "Recipe must be one of bf16, fp8_sub_channel, mxfp8, or nvfp4"
             if recipe_name == "mxfp8" and not mxfp8_available:
                 print(f"MXFP8 is not available, skipping {recipe_name}")
                 continue
             if recipe_name == "fp8_sub_channel" and not fp8_block_scaling_available:
                 print(f"FP8 block scaling is not available, skipping {recipe_name}")
                 continue
-            if recipe_name.startswith("nvfp4") and not nvfp4_available:
+            if recipe_name == "nvfp4" and not nvfp4_available:
                 print(f"NVFP4 is not available, skipping {recipe_name}")
                 continue
 
