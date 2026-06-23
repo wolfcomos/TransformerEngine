@@ -389,12 +389,12 @@ constexpr int kFusedWarpsPerRow = 1;
 
 template <int WARPS_PER_ROW, typename Cfg, int E4M3_MAX, typename IType>
 __global__ void __launch_bounds__(kFusedThreads)
-    fused_row_scaled_4over6_kernel(const IType *__restrict__ input,
-                                   fp4e2m1x2 *__restrict__ output,
-                                   nvfp4_scale_t *__restrict__ scales,
-                                   float *__restrict__ amax_out, const size_t rows,
-                                   const size_t cols, const size_t scale_stride,
-                                   const float *__restrict__ noop) {
+    group_quantize_row_scaled_4over6_kernel(const IType *__restrict__ input,
+                                            fp4e2m1x2 *__restrict__ output,
+                                            nvfp4_scale_t *__restrict__ scales,
+                                            float *__restrict__ amax_out, const size_t rows,
+                                            const size_t cols, const size_t scale_stride,
+                                            const float *__restrict__ noop) {
 #if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
   if (noop != nullptr && noop[0] == 1.0f) {
     return;
@@ -477,23 +477,24 @@ __global__ void __launch_bounds__(kFusedThreads)
 }
 
 template <typename Cfg, int E4M3_MAX, typename IType>
-void launch_fused_row_scaled_4over6(const IType *input, fp4e2m1x2 *output, nvfp4_scale_t *scales,
-                                    float *amax, const float *noop, const size_t rows,
-                                    const size_t cols, const size_t scale_stride,
-                                    cudaStream_t stream) {
+void launch_group_quantize_row_scaled_4over6(const IType *input, fp4e2m1x2 *output,
+                                             nvfp4_scale_t *scales, float *amax,
+                                             const float *noop, const size_t rows,
+                                             const size_t cols, const size_t scale_stride,
+                                             cudaStream_t stream) {
   if (rows == 0 || cols == 0) {
     return;
   }
   constexpr int kRowsPerBlock = kFusedBlockWarps / kFusedWarpsPerRow;
   const dim3 grid(static_cast<unsigned int>(DIVUP(rows, static_cast<size_t>(kRowsPerBlock))));
   const dim3 block(kFusedThreads);
-  fused_row_scaled_4over6_kernel<kFusedWarpsPerRow, Cfg, E4M3_MAX, IType>
+  group_quantize_row_scaled_4over6_kernel<kFusedWarpsPerRow, Cfg, E4M3_MAX, IType>
       <<<grid, block, 0, stream>>>(input, output, scales, amax, rows, cols, scale_stride, noop);
 }
 
 template <typename Cfg, int E4M3_MAX, typename IType>
-void launch_fused_row_scaled_4over6(const Tensor &input, const Tensor *noop, Tensor *output,
-                                    cudaStream_t stream) {
+void launch_group_quantize_row_scaled_4over6(const Tensor &input, const Tensor *noop,
+                                             Tensor *output, cudaStream_t stream) {
   const size_t rows = input.flat_first_dim();
   const size_t cols = input.flat_last_dim();
   if (rows == 0 || cols == 0) {
@@ -507,8 +508,8 @@ void launch_fused_row_scaled_4over6(const Tensor &input, const Tensor *noop, Ten
   const auto *noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
   const size_t scale_stride = output->scale_inv.shape[1];
 
-  launch_fused_row_scaled_4over6<Cfg, E4M3_MAX, IType>(input_ptr, output_ptr, scales_ptr, amax_ptr,
-                                                       noop_ptr, rows, cols, scale_stride, stream);
+  launch_group_quantize_row_scaled_4over6<Cfg, E4M3_MAX, IType>(
+      input_ptr, output_ptr, scales_ptr, amax_ptr, noop_ptr, rows, cols, scale_stride, stream);
 }
 
 }  // namespace group_quantize_4over6_kernel
@@ -565,7 +566,7 @@ inline void group_quantize_row_scaled_4over6(const Tensor &input, Tensor *output
                 using Cfg = quantize_4over6_kernel::Config<MODE, ERR_USE_FAST_MATH>;
                 TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
                     input.dtype(), IType,
-                    launch_fused_row_scaled_4over6<Cfg, E4M3_MAX, IType>(
+                    launch_group_quantize_row_scaled_4over6<Cfg, E4M3_MAX, IType>(
                         input, noop, output, stream););
               });););
 
