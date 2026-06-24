@@ -510,8 +510,7 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
   const auto logical_first_dim = logical_shape_py[0].cast<size_t>();
   const auto logical_last_dim = logical_shape_py[1].cast<size_t>();
   const std::vector<size_t> logical_shape = {logical_first_dim, logical_last_dim};
-  py::object quantizer_py = input.attr("quantizer");
-  const auto &quantizer = convert_quantizer(quantizer_py);
+  const auto &quantizer = convert_quantizer(input.attr("quantizer"));
 
   // Extract optional tensor attributes.
   auto get_optional_tensor = [&input](const char *name) -> std::optional<at::Tensor> {
@@ -550,7 +549,7 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
     if (rowwise_scale_inv.has_value()) {
       input_cpp.set_rowwise_scale_inv(rowwise_scale_inv->data_ptr(),
                                       detail::GetTransformerEngineDTypeForScaleInv(
-                                          quantizer_py, *rowwise_scale_inv),
+                                          input.attr("quantizer"), *rowwise_scale_inv),
                                       getTensorShape(*rowwise_scale_inv));
     }
   }
@@ -561,7 +560,8 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
     if (columnwise_scale_inv.has_value()) {
       input_cpp.set_columnwise_scale_inv(
           columnwise_scale_inv->data_ptr(),
-          detail::GetTransformerEngineDTypeForScaleInv(quantizer_py, *columnwise_scale_inv),
+          detail::GetTransformerEngineDTypeForScaleInv(input.attr("quantizer"),
+                                                       *columnwise_scale_inv),
           getTensorShape(*columnwise_scale_inv));
     }
   }
@@ -583,7 +583,7 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
                                  getTensorShape(*tensor_offsets));
   }
 
-  if (detail::IsNVFP4Quantizers(quantizer_py.ptr())) {
+  if (detail::IsNVFP4Quantizers(input.attr("quantizer").ptr())) {
     bool with_gemm_swizzled_scales = false;
     if (py::hasattr(input, "with_gemm_swizzled_scales")) {
       with_gemm_swizzled_scales = input.attr("with_gemm_swizzled_scales").cast<bool>();
