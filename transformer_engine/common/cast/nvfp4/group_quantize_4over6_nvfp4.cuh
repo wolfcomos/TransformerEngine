@@ -489,7 +489,8 @@ inline void group_quantize_row_scaled_4over6(const GroupedTensor *input, Grouped
   using namespace group_quantize_4over6_kernel;
 
   checkCuDriverContext(stream);
-  CheckInputGroupedTensor(*input, "input");
+  NVTE_CHECK(input->logical_shape.ndim == 2,
+             "Fused grouped 4over6 quantization requires a 2D input.");
   CheckOutputGroupedTensor(*output, "output");
 
   // Output allocation, FP4 dtype, scale/amax layout, and the 4over6 mode /
