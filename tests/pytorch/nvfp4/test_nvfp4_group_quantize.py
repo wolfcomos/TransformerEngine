@@ -66,6 +66,7 @@ def _make_4over6_quantizer(
     rowwise: bool = True,
     columnwise: bool = False,
     row_scaled: bool = False,
+    with_2d_quantization: bool = False,
 ) -> NVFP4Quantizer:
     return NVFP4Quantizer(
         fp4_dtype=te.DType.kFloat4E2M1,
@@ -75,7 +76,7 @@ def _make_4over6_quantizer(
         amax_reduction_group=None,
         with_rht=False,
         with_post_rht_amax=False,
-        with_2d_quantization=False,
+        with_2d_quantization=with_2d_quantization,
         stochastic_rounding=False,
         row_scaled_nvfp4=row_scaled,
         nvfp4_use_4over6=True,
@@ -194,12 +195,12 @@ def _assert_columnwise_matches_per_tensor(
 
 # Only the 4over6 configs are relevant: row-scaled grouped quant requires 4over6.
 _ROW_SCALED_4OVER6_CONFIGS = [cfg for cfg in NVFP4_4OVER6_CONFIGS if cfg.use_4over6]
-_REGULAR_4OVER6_CONFIGS = [cfg for cfg in NVFP4_4OVER6_CONFIGS if cfg.use_4over6]
+_TENSOR_SCALED_4OVER6_CONFIGS = [cfg for cfg in NVFP4_4OVER6_CONFIGS if cfg.use_4over6]
 
 
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
 @pytest.mark.parametrize("err_use_fast_math", [False, True], ids=["exact_err", "fast_err"])
-def test_regular_4over6_group_quantize_from_recipe_state(err_use_fast_math: bool) -> None:
+def test_tensor_scaled_4over6_group_quantize_from_recipe_state(err_use_fast_math: bool) -> None:
     """4over6 recipe-state quantizers should route through native group quantization."""
 
     device = "cuda"
@@ -336,7 +337,7 @@ def test_row_scaled_4over6_group_quantize_matches_reference(
     )
 
 
-# Regular 4over6 grouped quant path.
+# Tensor-scaled 4over6 grouped quant path.
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
 @pytest.mark.parametrize(
     "compute_amax, quantize_mode, precomputed_offsets",
@@ -366,9 +367,9 @@ def test_row_scaled_4over6_group_quantize_matches_reference(
     ],
 )
 @pytest.mark.parametrize(
-    "cfg", _REGULAR_4OVER6_CONFIGS, ids=[cfg.id for cfg in _REGULAR_4OVER6_CONFIGS]
+    "cfg", _TENSOR_SCALED_4OVER6_CONFIGS, ids=[cfg.id for cfg in _TENSOR_SCALED_4OVER6_CONFIGS]
 )
-def test_regular_4over6_group_quantize_matches_per_tensor(
+def test_tensor_scaled_4over6_group_quantize_matches_per_tensor(
     compute_amax: bool,
     quantize_mode: str,
     precomputed_offsets: bool,
@@ -377,7 +378,7 @@ def test_regular_4over6_group_quantize_matches_per_tensor(
     splits: list[int],
     cfg,
 ) -> None:
-    """Grouped regular 4over6 quantization should match per-tensor quantization."""
+    """Grouped tensor-scaled 4over6 quantization should match per-tensor quantization."""
 
     device = "cuda"
     torch.manual_seed(9876)
@@ -428,6 +429,71 @@ def test_regular_4over6_group_quantize_matches_per_tensor(
         _assert_rowwise_matches_per_tensor(
             grouped, refs, expected_amax, splits, rows, hidden
         )
+    if return_columnwise:
+        _assert_columnwise_matches_per_tensor(
+            grouped, refs, expected_amax, splits, hidden
+        )
+
+
+@pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
+@pytest.mark.parametrize("compute_amax", [False, True], ids=["with_amax", "compute_amax"])
+@pytest.mark.parametrize(
+    "return_columnwise", [False, True], ids=["rowwise_only", "both_directions"]
+)
+@pytest.mark.parametrize(
+    "rows, hidden, splits",
+    [
+        (384, 512, [128, 256]),
+        (768, 384, [128, 256, 384]),  # uneven 128-aligned splits, padded scale columns
+    ],
+)
+@pytest.mark.parametrize(
+    "cfg", _TENSOR_SCALED_4OVER6_CONFIGS, ids=[cfg.id for cfg in _TENSOR_SCALED_4OVER6_CONFIGS]
+)
+def test_tensor_scaled_4over6_group_quantize_2d_matches_per_tensor(
+    compute_amax: bool,
+    return_columnwise: bool,
+    rows: int,
+    hidden: int,
+    splits: list[int],
+    cfg,
+) -> None:
+    """Grouped tensor-scaled 2D 4over6 quantization should match per-tensor quantization."""
+
+    device = "cuda"
+    torch.manual_seed(8765)
+    torch.cuda.manual_seed(8765)
+
+    assert sum(splits) == rows and rows % 16 == 0 and hidden % 16 == 0
+    assert all(split % 16 == 0 for split in splits)
+    first_dims = torch.tensor(splits, dtype=torch.int64, device=device)
+    x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
+    x_chunks = torch.split(x, splits)
+    quantizer = _make_4over6_quantizer(
+        cfg.err_mode,
+        cfg.e4m3_max,
+        rowwise=True,
+        columnwise=return_columnwise,
+        with_2d_quantization=True,
+    )
+
+    expected_amax = torch.stack([chunk.abs().amax().float() for chunk in x_chunks])
+
+    with nvfp4_4over6_err_fast_math(cfg.err_use_fast_math):
+        if compute_amax:
+            grouped = tex.group_quantize(x, quantizer, len(splits), first_dims)
+        else:
+            grouped = tex.nvfp4_group_quantize_with_amax(
+                x,
+                quantizer,
+                len(splits),
+                first_dims,
+                expected_amax,
+                expected_amax,
+            )
+        refs = [quantizer(chunk) for chunk in x_chunks]
+
+    _assert_rowwise_matches_per_tensor(grouped, refs, expected_amax, splits, rows, hidden)
     if return_columnwise:
         _assert_columnwise_matches_per_tensor(
             grouped, refs, expected_amax, splits, hidden

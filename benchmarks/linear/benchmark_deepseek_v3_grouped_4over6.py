@@ -8,11 +8,13 @@
 Timing granularity: end-to-end GroupedLinear forward + backward, including
 quantization and GEMMs.  This is not an isolated quantize-kernel benchmark.
 
-The "group" path is a benchmark-only adapter.  In TE today,
-backward_override="high_precision" disables the native grouped-tensor module
-path, so this script wraps tex.split_quantize and routes activation split
-quantization through tex.group_quantize.  The GroupedTensor is then split back
-to the per-expert tensor list expected by the high-precision path.
+This is a benchmark-only adapter.  In TE today, backward_override="high_precision"
+disables the native grouped-tensor module path, so this script wraps
+tex.split_quantize.  The "split" path keeps the legacy split path when possible
+and uses a Python loop over flat quantizers for 2D activation quantization.  The
+"group" path routes activation split quantization through tex.group_quantize and
+then splits the GroupedTensor back to the per-expert tensor list expected by the
+high-precision path.
 """
 
 from __future__ import annotations
@@ -37,13 +39,14 @@ import transformer_engine_torch as tex
 
 
 FLAT_4OVER6_KERNEL = "quantize_4over6_kernel"
-REGULAR_GROUP_KERNEL = "group_quantize_4over6_kernel"
+TENSOR_SCALED_GROUP_KERNEL = "group_quantize_4over6_kernel"
 ROWSCALED_GROUP_KERNEL = "group_quantize_row_scaled_4over6_kernel"
 
 
 @dataclasses.dataclass
 class QuantPathStats:
     split_quantize_calls: int = 0
+    loop_quantize_calls: int = 0
     group_quantize_calls: int = 0
 
 
@@ -72,9 +75,9 @@ def _make_recipe(recipe_name: str) -> te_recipe.NVFP4BlockScaling:
         backward_override="high_precision",
     )
 
-    if recipe_name == "regular_2d":
+    if recipe_name == "tensor_scaled_2d":
         recipe = te_recipe.NVFP4BlockScaling(**common)
-        recipe.fp4_quant_fwd_inp = te_recipe.QParams()
+        recipe.fp4_quant_fwd_inp = te_recipe.QParams(fp4_2d_quantization=True)
         recipe.fp4_quant_fwd_weight = te_recipe.QParams(fp4_2d_quantization=True)
         recipe.fp4_quant_bwd_grad = te_recipe.QParams()
         return recipe
@@ -97,6 +100,10 @@ def _is_row_scaled_quantizer(quantizer: NVFP4Quantizer) -> bool:
     return bool(getattr(quantizer, "row_scaled_nvfp4", False))
 
 
+def _is_2d_quantizer(quantizer: NVFP4Quantizer) -> bool:
+    return bool(getattr(quantizer, "with_2d_quantization", False))
+
+
 def _check_group_quant_supported(
     tensor: torch.Tensor,
     split_sections: list[int],
@@ -114,11 +121,20 @@ def _check_group_quant_supported(
 
     if tensor.shape[-1] % 128 != 0 or any(split % 128 != 0 for split in split_sections):
         raise RuntimeError(
-            "Regular grouped NVFP4 4over6 compute-amax currently requires hidden and every "
+            "Tensor-scaled grouped NVFP4 4over6 compute-amax currently requires hidden and every "
             "split section to be 128-aligned. Use DeepSeek-like aligned splits or benchmark "
             "the split path for this shape."
         )
     return quantizer
+
+
+def _loop_flat_quantize_2d(
+    tensor: torch.Tensor,
+    split_sections: list[int],
+    quantizers: Iterable[NVFP4Quantizer],
+) -> list[object]:
+    chunks = torch.split(tensor, split_sections)
+    return [quantizer(chunk) for quantizer, chunk in zip(quantizers, chunks)]
 
 
 @contextlib.contextmanager
@@ -127,6 +143,11 @@ def _quant_path(path: str, stats: QuantPathStats):
 
     def split_path(tensor, split_sections, quantizers, *args, **kwargs):
         stats.split_quantize_calls += 1
+        split_list = _split_sections_to_list(split_sections)
+        quantizer_list = list(quantizers)
+        if all(isinstance(q, NVFP4Quantizer) and _is_2d_quantizer(q) for q in quantizer_list):
+            stats.loop_quantize_calls += 1
+            return _loop_flat_quantize_2d(tensor, split_list, quantizer_list)
         return original_split_quantize(tensor, split_sections, quantizers, *args, **kwargs)
 
     def group_path(tensor, split_sections, quantizers, *args, **kwargs):
@@ -197,7 +218,9 @@ def _profile_once(
     joined = "\n".join(names)
     expected = FLAT_4OVER6_KERNEL
     if path == "group":
-        expected = ROWSCALED_GROUP_KERNEL if recipe_name == "row_scaled_1d" else REGULAR_GROUP_KERNEL
+        expected = (
+            ROWSCALED_GROUP_KERNEL if recipe_name == "row_scaled_1d" else TENSOR_SCALED_GROUP_KERNEL
+        )
 
     found_expected = expected in joined
     if assert_kernels and not found_expected:
@@ -265,6 +288,7 @@ def _bench_case(args, recipe_name: str, path: str, splits: list[int]) -> dict[st
         "min_ms": min(times_ms),
         "iters": len(times_ms),
         "split_quantize_calls": stats.split_quantize_calls,
+        "loop_quantize_calls": stats.loop_quantize_calls,
         "group_quantize_calls": stats.group_quantize_calls,
         **sanity,
     }
@@ -277,7 +301,9 @@ def main() -> None:
     parser.add_argument("--n", type=int, default=2048)
     parser.add_argument("--num-gemms", type=int, default=8)
     parser.add_argument("--splits", type=str, default=None)
-    parser.add_argument("--recipe", choices=["regular_2d", "row_scaled_1d", "all"], default="all")
+    parser.add_argument(
+        "--recipe", choices=["tensor_scaled_2d", "row_scaled_1d", "all"], default="all"
+    )
     parser.add_argument("--path", choices=["split", "group", "all"], default="all")
     parser.add_argument("--fwd-only", action="store_true")
     parser.add_argument("--warmup", type=int, default=10)
@@ -297,7 +323,7 @@ def main() -> None:
 
     os.environ.setdefault("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "1")
     splits = _parse_splits(args.splits, args.m, args.num_gemms)
-    recipes = ["regular_2d", "row_scaled_1d"] if args.recipe == "all" else [args.recipe]
+    recipes = ["tensor_scaled_2d", "row_scaled_1d"] if args.recipe == "all" else [args.recipe]
     paths = ["split", "group"] if args.path == "all" else [args.path]
 
     rows = []

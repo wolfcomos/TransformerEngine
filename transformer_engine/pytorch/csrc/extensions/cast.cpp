@@ -165,9 +165,8 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
   const bool nvfp4_use_4over6 =
       nvfp4_quantizer_cpp->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
 
-  // assert the 2D scaling case, since 2D scaling grouped quant kernel is not ready yet
-  NVTE_CHECK(!nvfp4_quantizer_cpp->with_2d_quantization,
-             "2D scaling grouped quant kernel is not ready yet");
+  NVTE_CHECK(!nvfp4_quantizer_cpp->with_2d_quantization || nvfp4_use_4over6,
+             "2D scaling grouped NVFP4 quantization is only supported with a 4over6 mode.");
   if (row_scaled_nvfp4) {
     NVTE_CHECK(nvfp4_use_4over6,
                "Row-scaled NVFP4 grouped quantization is only supported with a 4over6 mode.");

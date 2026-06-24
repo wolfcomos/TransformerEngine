@@ -278,6 +278,53 @@ __device__ __forceinline__ void quantize_group_rowwise(
 }
 
 template <typename Cfg, int E4M3_MAX, typename IType>
+__device__ __forceinline__ void quantize_group_rowwise_2d(
+    const IType *__restrict__ input, fp4e2m1x2 *__restrict__ output,
+    nvfp4_scale_t *__restrict__ scales, const float *__restrict__ amax,
+    const int64_t *__restrict__ offsets, const size_t rows, const size_t cols,
+    const size_t num_tensors, const size_t scale_stride, const bool has_first_dims,
+    const size_t group_idx) {
+  const size_t col_groups = cols / kGroupSize;
+  const size_t lane_in_tile = group_idx % kGroupSize;
+  const size_t tile_idx = group_idx / kGroupSize;
+  const size_t col_group = tile_idx % col_groups;
+  const size_t row_group = tile_idx / col_groups;
+  const size_t row_start = row_group * kGroupSize;
+  const size_t row = row_start + lane_in_tile;
+  if (row >= rows) {
+    return;
+  }
+
+  const size_t col = col_group * kGroupSize;
+  const size_t tensor_id =
+      group_4over6::tensor_id_from_row(row_start, rows, cols, num_tensors, has_first_dims, offsets);
+  const size_t tensor_row_start = group_4over6::tensor_start_row_from_id(
+      tensor_id, rows, cols, num_tensors, has_first_dims, offsets);
+  const size_t tensor_rows =
+      group_4over6::tensor_rows_from_id(tensor_id, rows, cols, num_tensors, has_first_dims, offsets);
+  const size_t local_row = row_start - tensor_row_start;
+  if (local_row + kGroupSize > tensor_rows) {
+    return;
+  }
+  const float global_amax = amax[tensor_id];
+
+  float x0[kElementsPerHalfGroup];
+  float x1[kElementsPerHalfGroup];
+  float group_amax = 0.0f;
+  load_global_row_group(input, row, cols, col, x0, x1, &group_amax);
+
+  const float block_amax = reduce_group_max_16(group_amax);
+  const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, global_amax);
+  CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
+  const float err_map4 = reduce_group_sum_16(candidates.map4.err);
+  const float err_map6 = reduce_group_sum_16(candidates.map6.err);
+  const bool pick_map4 = err_map4 < err_map6;
+
+  scales[row * scale_stride + col_group] = select_scale(scale_pair, pick_map4);
+  store_packed_group(select_packed(candidates, pick_map4), &output[(row * cols + col) / 2]);
+}
+
+template <typename Cfg, int E4M3_MAX, typename IType>
 __device__ __forceinline__ void quantize_group_colwise(
     const IType *__restrict__ input, fp4e2m1x2 *__restrict__ output_t,
     nvfp4_scale_t *__restrict__ scales_t, const float *__restrict__ amax,
@@ -318,7 +365,60 @@ __device__ __forceinline__ void quantize_group_colwise(
       &output_t[tensor_colwise_offset]);
 }
 
-template <bool RETURN_ROWWISE, bool RETURN_COLUMNWISE, typename Cfg, int E4M3_MAX, typename IType>
+template <typename Cfg, int E4M3_MAX, typename IType>
+__device__ __forceinline__ void quantize_group_colwise_2d(
+    const IType *__restrict__ input, fp4e2m1x2 *__restrict__ output_t,
+    nvfp4_scale_t *__restrict__ scales_t, const float *__restrict__ amax,
+    const int64_t *__restrict__ offsets, const size_t rows, const size_t cols,
+    const size_t num_tensors, const bool has_first_dims, const size_t group_idx) {
+  const size_t col_groups = cols / kGroupSize;
+  const size_t row_groups = rows / kGroupSize;
+  const size_t lane_in_tile = group_idx % kGroupSize;
+  const size_t tile_idx = group_idx / kGroupSize;
+  const size_t col_group = tile_idx % col_groups;
+  const size_t row_group = tile_idx / col_groups;
+  if (row_group >= row_groups) {
+    return;
+  }
+
+  const size_t row_start = row_group * kGroupSize;
+  const size_t col = col_group * kGroupSize + lane_in_tile;
+  const size_t tensor_id =
+      group_4over6::tensor_id_from_row(row_start, rows, cols, num_tensors, has_first_dims, offsets);
+  const size_t tensor_row_start = group_4over6::tensor_start_row_from_id(
+      tensor_id, rows, cols, num_tensors, has_first_dims, offsets);
+  const size_t tensor_rows =
+      group_4over6::tensor_rows_from_id(tensor_id, rows, cols, num_tensors, has_first_dims, offsets);
+  const size_t local_row = row_start - tensor_row_start;
+  if (local_row + kGroupSize > tensor_rows) {
+    return;
+  }
+  const float global_amax = amax[tensor_id];
+
+  float x0[kElementsPerHalfGroup];
+  float x1[kElementsPerHalfGroup];
+  float group_amax = 0.0f;
+  load_global_col_group(input, row_start, cols, col, x0, x1, &group_amax);
+
+  const float block_amax = reduce_group_max_16(group_amax);
+  const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, global_amax);
+  CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
+  const float err_map4 = reduce_group_sum_16(candidates.map4.err);
+  const float err_map6 = reduce_group_sum_16(candidates.map6.err);
+  const bool pick_map4 = err_map4 < err_map6;
+
+  const size_t tensor_scale_offset = group_4over6::columnwise_scale_offset_from_id(
+      tensor_id, rows, cols, num_tensors, has_first_dims, offsets);
+  const size_t tensor_scale_stride = group_4over6::columnwise_scale_cols_device(tensor_rows);
+  const size_t tensor_packed_offset = (tensor_row_start * cols) / 2;
+  const size_t tensor_colwise_offset = tensor_packed_offset + (col * tensor_rows + local_row) / 2;
+  scales_t[tensor_scale_offset + col * tensor_scale_stride + local_row / kGroupSize] =
+      select_scale(scale_pair, pick_map4);
+  store_packed_group(select_packed(candidates, pick_map4), &output_t[tensor_colwise_offset]);
+}
+
+template <bool USE_2D_QUANTIZATION, bool RETURN_ROWWISE, bool RETURN_COLUMNWISE, typename Cfg,
+          int E4M3_MAX, typename IType>
 __global__ void __launch_bounds__(kThreads)
     group_quantize_4over6_kernel(
         const IType *__restrict__ input, fp4e2m1x2 *__restrict__ output,
@@ -334,8 +434,15 @@ __global__ void __launch_bounds__(kThreads)
 
   const size_t group_idx = blockIdx.x * blockDim.x + threadIdx.x;
   if constexpr (RETURN_ROWWISE) {
-    quantize_group_rowwise<Cfg, E4M3_MAX>(input, output, scales, amax_rowwise, offsets, rows, cols,
-                                          num_tensors, scale_stride, has_first_dims, group_idx);
+    if constexpr (USE_2D_QUANTIZATION) {
+      quantize_group_rowwise_2d<Cfg, E4M3_MAX>(input, output, scales, amax_rowwise, offsets, rows,
+                                               cols, num_tensors, scale_stride, has_first_dims,
+                                               group_idx);
+    } else {
+      quantize_group_rowwise<Cfg, E4M3_MAX>(input, output, scales, amax_rowwise, offsets, rows,
+                                            cols, num_tensors, scale_stride, has_first_dims,
+                                            group_idx);
+    }
   }
 
   if constexpr (RETURN_COLUMNWISE) {
@@ -343,15 +450,21 @@ __global__ void __launch_bounds__(kThreads)
     if (columnwise_amax == nullptr) {
       columnwise_amax = amax_rowwise;
     }
-    quantize_group_colwise<Cfg, E4M3_MAX>(input, output_t, scales_t, columnwise_amax, offsets, rows,
-                                          cols, num_tensors, has_first_dims, group_idx);
+    if constexpr (USE_2D_QUANTIZATION) {
+      quantize_group_colwise_2d<Cfg, E4M3_MAX>(input, output_t, scales_t, columnwise_amax, offsets,
+                                               rows, cols, num_tensors, has_first_dims, group_idx);
+    } else {
+      quantize_group_colwise<Cfg, E4M3_MAX>(input, output_t, scales_t, columnwise_amax, offsets,
+                                            rows, cols, num_tensors, has_first_dims, group_idx);
+    }
   }
 #else
   NVTE_DEVICE_ERROR("sm_100 or higher is required.");
 #endif
 }
 
-template <bool RETURN_ROWWISE, bool RETURN_COLUMNWISE, typename Cfg, int E4M3_MAX, typename IType>
+template <bool USE_2D_QUANTIZATION, bool RETURN_ROWWISE, bool RETURN_COLUMNWISE, typename Cfg,
+          int E4M3_MAX, typename IType>
 void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *output,
                                   const Tensor *noop, cudaStream_t stream) {
   const size_t rows = input->logical_shape.data[0];
@@ -376,7 +489,8 @@ void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   const auto *noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
   const size_t scale_stride = RETURN_ROWWISE ? group_4over6::rowwise_scale_cols(cols) : 0;
 
-  group_quantize_4over6_kernel<RETURN_ROWWISE, RETURN_COLUMNWISE, Cfg, E4M3_MAX, IType>
+  group_quantize_4over6_kernel<USE_2D_QUANTIZATION, RETURN_ROWWISE, RETURN_COLUMNWISE, Cfg,
+                               E4M3_MAX, IType>
       <<<grid, block, 0, stream>>>(input_ptr, output_ptr, output_t_ptr, scales_ptr, scales_t_ptr,
                                    amax_rowwise_ptr, amax_colwise_ptr, offsets_ptr, rows, cols,
                                    output->num_tensors, scale_stride,
@@ -588,8 +702,6 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   NVTE_CHECK(quant_config != nullptr &&
                  quant_config->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled,
              "Grouped NVFP4 4over6 quantization requires a non-disabled 4over6 mode.");
-  NVTE_CHECK(!quant_config->nvfp4_2d_quantization,
-             "Grouped NVFP4 4over6 quantization currently supports 1D quantization only.");
   NVTE_CHECK(!quant_config->stochastic_rounding,
              "Grouped NVFP4 4over6 quantization does not support stochastic rounding.");
   NVTE_CHECK(!output->row_scaled_nvfp4,
@@ -609,6 +721,9 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   const size_t cols = logical_shape[1];
   const bool return_rowwise = output->has_data();
   const bool return_columnwise = output->has_columnwise_data();
+  const bool use_2d_quantization = quant_config->nvfp4_2d_quantization;
+  NVTE_CHECK(!use_2d_quantization || return_rowwise,
+             "Grouped NVFP4 4over6 2D quantization requires rowwise output.");
 
   NVTE_CHECK(input->data.numel() == rows * cols,
              "Grouped NVFP4 4over6 input rowwise data has wrong size.");
@@ -666,6 +781,13 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
              kGroupSize, " when first_dims are not provided.");
   NVTE_CHECK(shape_rep != ShapeRepresentation::VARYING_FIRST_DIM || output->tensor_offsets.dptr,
              "Grouped NVFP4 4over6 quantization requires tensor_offsets for varying first dims.");
+  NVTE_CHECK(!use_2d_quantization || rows % kGroupSize == 0,
+             "Grouped NVFP4 4over6 2D quantization requires first dim divisible by ", kGroupSize,
+             ".");
+  NVTE_CHECK(!use_2d_quantization || shape_rep != ShapeRepresentation::SAME_BOTH_DIMS ||
+                 (rows / output->num_tensors) % kGroupSize == 0,
+             "Grouped NVFP4 4over6 2D quantization requires each tensor first dim divisible by ",
+             kGroupSize, " when first_dims are not provided.");
 
   Tensor dummy_tensor;
   const Tensor *noop = &dummy_tensor;
@@ -684,9 +806,12 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
                     input->dtype(), IType, {
                       TRANSFORMER_ENGINE_SWITCH_CONDITION(return_rowwise, RETURN_ROWWISE, {
                         TRANSFORMER_ENGINE_SWITCH_CONDITION(return_columnwise, RETURN_COLUMNWISE, {
-                          launch_group_quantize_4over6<RETURN_ROWWISE, RETURN_COLUMNWISE, Cfg,
-                                                       E4M3_MAX, IType>(input, output, noop,
-                                                                        stream);
+                          TRANSFORMER_ENGINE_SWITCH_CONDITION(
+                              use_2d_quantization, USE_2D_QUANTIZATION, {
+                                launch_group_quantize_4over6<USE_2D_QUANTIZATION, RETURN_ROWWISE,
+                                                             RETURN_COLUMNWISE, Cfg, E4M3_MAX,
+                                                             IType>(input, output, noop, stream);
+                              });
                         });
                       });
                     });
