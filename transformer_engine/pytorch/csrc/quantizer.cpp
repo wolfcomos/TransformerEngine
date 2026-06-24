@@ -1997,8 +1997,25 @@ std::pair<GroupedTensorWrapper, py::object> NVFP4Quantizer::create_grouped_tenso
 
   if (rowwise_usage) {
     rowwise_data = at::empty({total_data_elements}, uint8_opts);
-    const auto scale_shape = get_scale_shape(logical_shape_vec, false);
-    const int64_t total_scale_elements = static_cast<int64_t>(product(scale_shape));
+    int64_t total_scale_elements = 0;
+    if (row_scaled_nvfp4) {
+      const size_t scale_cols = roundup(ceildiv(logical_last_dim, NVFP4_BLOCK_SIZE), 4);
+      size_t scale_rows = 0;
+      if (first_dims.has_value()) {
+        // Device first_dims cannot be summed here without D2H; this upper bound covers
+        // per-split 128-row scale padding for graph-safe grouped dispatch.
+        scale_rows = roundup(logical_first_dim, 128) + 128 * (num_tensors - 1);
+      } else {
+        NVTE_CHECK(logical_first_dim % num_tensors == 0,
+                   "Grouped row-scaled NVFP4 quantization requires rows divisible by num_tensors "
+                   "when first_dims are not provided.");
+        scale_rows = num_tensors * roundup(logical_first_dim / num_tensors, 128);
+      }
+      total_scale_elements = static_cast<int64_t>(scale_rows * scale_cols);
+    } else {
+      const auto scale_shape = get_scale_shape(logical_shape_vec, false);
+      total_scale_elements = static_cast<int64_t>(product(scale_shape));
+    }
     rowwise_scale_inv = at::empty({total_scale_elements}, uint8_opts);
     const int64_t amax_elements = row_scaled_nvfp4 ? static_cast<int64_t>(logical_first_dim)
                                                    : static_cast<int64_t>(num_tensors);
