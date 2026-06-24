@@ -522,8 +522,6 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
   auto columnwise_data = get_optional_tensor("columnwise_data");
   auto rowwise_scale_inv = get_optional_tensor("scale_inv");
   auto columnwise_scale_inv = get_optional_tensor("columnwise_scale_inv");
-  auto rowwise_amax = get_optional_tensor("amax");
-  auto columnwise_amax = get_optional_tensor("columnwise_amax");
   auto first_dims = get_optional_tensor("first_dims");
   auto last_dims = get_optional_tensor("last_dims");
   auto tensor_offsets = get_optional_tensor("tensor_offsets");
@@ -564,13 +562,6 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
                                                        *columnwise_scale_inv),
           getTensorShape(*columnwise_scale_inv));
     }
-  }
-  if (rowwise_amax.has_value()) {
-    input_cpp.set_amax(rowwise_amax->data_ptr(), DType::kFloat32, getTensorShape(*rowwise_amax));
-  }
-  if (columnwise_amax.has_value()) {
-    input_cpp.set_columnwise_amax(columnwise_amax->data_ptr(), DType::kFloat32,
-                                  getTensorShape(*columnwise_amax));
   }
   if (first_dims.has_value()) {
     input_cpp.set_first_dims(first_dims->data_ptr(), DType::kInt64, getTensorShape(*first_dims));
