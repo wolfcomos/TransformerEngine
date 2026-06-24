@@ -994,8 +994,6 @@ class GroupedTensorStorage:
         # Case 2: Quantized tensors
         recipe = self.quantizer._get_compatible_recipe()
 
-        row_scaled_nvfp4 = recipe.nvfp4() and self.row_scaled_nvfp4
-
         # populate scale_inv_offsets from the tensor offsets
         if self.scale_inv is not None and self.scale_inv_offsets is None:
             if recipe.nvfp4() or recipe.mxfp8() or recipe.float8_block_scaling():
@@ -1018,6 +1016,7 @@ class GroupedTensorStorage:
                     columnwise_scale_inv_offsets.append(cum)
                 self.columnwise_scale_inv_offsets = columnwise_scale_inv_offsets
         nvfp4_rowwise_amax_offsets = None
+        row_scaled_nvfp4 = self.row_scaled_nvfp4
         nvfp4_use_4over6 = self.nvfp4_use_4over6
         nvfp4_e4m3_max = self.nvfp4_e4m3_max
         if recipe.nvfp4() and row_scaled_nvfp4:
@@ -1195,16 +1194,14 @@ class GroupedTensorStorage:
                 amax_rowwise = None
                 amax_columnwise = None
 
-                if self.scale_inv is not None:
-                    if self.scale_inv_offsets is not None:
-                        scale_start = self.scale_inv_offsets[i]
-                        # for paged stashing, scale_inv should depend on the split offsets
-                        scale_end = self.scale_inv_offsets[i + 1]
+                if self.scale_inv is not None and self.scale_inv_offsets is not None:
+                    scale_start = self.scale_inv_offsets[i]
+                    # for paged stashing, scale_inv should depend on the split offsets
+                    scale_end = self.scale_inv_offsets[i + 1]
 
-                        scale_shape = quantizer.get_scale_shape(tensor_shape, False)
-                        rowwise_scale_inv = self.scale_inv[scale_start:scale_end].view(
-                            scale_shape
-                        )
+                    # Get scale shape from quantizer
+                    scale_shape = quantizer.get_scale_shape(tensor_shape, False)
+                    rowwise_scale_inv = self.scale_inv[scale_start:scale_end].view(scale_shape)
 
                 if (
                     self.columnwise_scale_inv is not None
