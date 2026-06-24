@@ -477,7 +477,7 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
       NVTE_CHECK(!output_tensor->with_gemm_swizzled_scales,
                  "Grouped NVFP4 4over6 quantization requires compact scale layout.");
 
-      if (output_tensor->row_scaled_nvfp4) {
+      if (quant_config_cpp.nvfp4_row_scaled) {
         NVTE_CHECK(output_tensor->has_data(),
                    "Row-scaled grouped NVFP4 4over6 quantization requires rowwise output data.");
         NVTE_CHECK(!output_tensor->has_columnwise_data(),
@@ -488,7 +488,7 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
                                                                 "Grouped quantize input");
         Tensor output_view =
             nvfp4::group_4over6::make_row_scaled_grouped_output_tensor_view(
-                *output_tensor, "Grouped quantize output");
+                *output_tensor, "Grouped quantize output", quant_config_cpp.nvfp4_e4m3_max);
         nvfp4::group_quantize_row_scaled_4over6(input_view, &output_view, &quant_config_cpp,
                                                 stream);
       } else {

@@ -47,6 +47,8 @@ QuantizationConfigWrapper make_nvfp4_quant_config(const NVFP4Quantizer &quantize
   QuantizationConfigWrapper quant_config;
   quant_config.set_nvfp4_4over6_mode(quantizer.nvfp4_4over6_mode);
   quant_config.set_nvfp4_2d_quantization(quantizer.with_2d_quantization);
+  quant_config.set_nvfp4_row_scaled(quantizer.row_scaled_nvfp4);
+  quant_config.set_nvfp4_e4m3_max(quantizer.nvfp4_e4m3_max);
 
   const auto use_fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
   if (use_fast_math && quantizer.nvfp4_4over6_mode == kNVTENVFP44Over6Disabled) {
@@ -591,28 +593,14 @@ py::object group_dequantize(const py::handle &input, transformer_engine::DType o
   }
 
   if (detail::IsNVFP4Quantizers(quantizer_py.ptr())) {
-    bool row_scaled_nvfp4 = false;
-    if (py::hasattr(input, "row_scaled_nvfp4")) {
-      row_scaled_nvfp4 = input.attr("row_scaled_nvfp4").cast<bool>();
-    } else if (py::hasattr(input, "_row_scaled_nvfp4")) {
-      row_scaled_nvfp4 = input.attr("_row_scaled_nvfp4").cast<bool>();
-    }
     bool with_gemm_swizzled_scales = false;
     if (py::hasattr(input, "with_gemm_swizzled_scales")) {
       with_gemm_swizzled_scales = input.attr("with_gemm_swizzled_scales").cast<bool>();
     } else if (py::hasattr(input, "_with_gemm_swizzled_scales")) {
       with_gemm_swizzled_scales = input.attr("_with_gemm_swizzled_scales").cast<bool>();
     }
-    int nvfp4_e4m3_max = 448;
-    if (py::hasattr(input, "nvfp4_e4m3_max")) {
-      nvfp4_e4m3_max = input.attr("nvfp4_e4m3_max").cast<int>();
-    } else if (py::hasattr(input, "_nvfp4_e4m3_max")) {
-      nvfp4_e4m3_max = input.attr("_nvfp4_e4m3_max").cast<int>();
-    }
 
     input_cpp.set_with_gemm_swizzled_scales(with_gemm_swizzled_scales);
-    input_cpp.set_row_scaled_nvfp4(row_scaled_nvfp4);
-    input_cpp.set_nvfp4_e4m3_max(nvfp4_e4m3_max);
   }
 
   // Create output GroupedTensor using NoneQuantizer.

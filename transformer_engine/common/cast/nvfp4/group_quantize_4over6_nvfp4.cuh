@@ -38,30 +38,10 @@ inline std::vector<size_t> logical_shape_2d(const GroupedTensor &tensor, const c
   return std::vector<size_t>{tensor.logical_shape.data[0], tensor.logical_shape.data[1]};
 }
 
-inline size_t scale_cols(const size_t dim, const char *dim_name) {
-  NVTE_CHECK(dim % kGroupSize == 0, "Grouped NVFP4 4over6 requires ", dim_name, " divisible by ",
-             kGroupSize, ".");
-  return DIVUP_TO_MULTIPLE(dim / kGroupSize, static_cast<size_t>(4));
-}
-
-// Scale-inv shape for a grouped NVFP4 4over6 tensor. `tile_dim` is the dimension
-// padded to a multiple of 128, `group_dim` is the dimension split into
-// kGroupSize groups. Rowwise tiles rows and groups cols; the columnwise layout
-// swaps the two (i.e. make_scale_shape(cols, rows, ...)).
-inline std::vector<size_t> make_scale_shape(const size_t tile_dim, const size_t group_dim,
-                                            const char *group_dim_name) {
-  return std::vector<size_t>{DIVUP_TO_MULTIPLE(tile_dim, static_cast<size_t>(128)),
-                             scale_cols(group_dim, group_dim_name)};
-}
-
 inline Tensor make_grouped_input_tensor_view(const GroupedTensor &grouped_input,
                                              const char *name) {
   const auto logical_shape = logical_shape_2d(grouped_input, name);
   NVTE_CHECK(grouped_input.data.dptr != nullptr, name, " rowwise data must be allocated.");
-  NVTE_CHECK(grouped_input.data.numel() == logical_shape[0] * logical_shape[1], name,
-             " rowwise data must have ", logical_shape[0] * logical_shape[1],
-             " entries for logical shape ", logical_shape, ", got ", grouped_input.data.shape,
-             ".");
 
   Tensor input_view;
   input_view.scaling_mode = grouped_input.scaling_mode;
@@ -70,30 +50,21 @@ inline Tensor make_grouped_input_tensor_view(const GroupedTensor &grouped_input,
 }
 
 inline Tensor make_row_scaled_grouped_output_tensor_view(const GroupedTensor &grouped_output,
-                                                         const char *name) {
+                                                         const char *name,
+                                                         const int nvfp4_e4m3_max) {
   const auto logical_shape = logical_shape_2d(grouped_output, name);
   const size_t rows = logical_shape[0];
   const size_t cols = logical_shape[1];
-  const auto scale_shape = make_scale_shape(rows, cols, "last dim");
+  // scale_inv shape: rows padded to a multiple of 128, cols grouped by kGroupSize then up to 4.
+  const std::vector<size_t> scale_shape = {
+      DIVUP_TO_MULTIPLE(rows, static_cast<size_t>(128)),
+      DIVUP_TO_MULTIPLE(cols / kGroupSize, static_cast<size_t>(4))};
 
   NVTE_CHECK(grouped_output.data.dptr != nullptr, name, " rowwise data must be allocated.");
   NVTE_CHECK(is_fp4_dtype(grouped_output.data.dtype), name, " rowwise data must have FP4 type.");
-  NVTE_CHECK(grouped_output.data.numel() == rows * cols / 2, name, " rowwise data must have ",
-             rows * cols / 2, " packed entries for logical shape ", logical_shape, ", got ",
-             grouped_output.data.shape, ".");
   NVTE_CHECK(grouped_output.scale_inv.dptr != nullptr, name,
              " rowwise scale_inv must be allocated.");
-  NVTE_CHECK(grouped_output.scale_inv.dtype == DType::kFloat8E4M3, name,
-             " rowwise scale_inv must have Float8E4M3 dtype.");
-  NVTE_CHECK(grouped_output.scale_inv.numel() == product(scale_shape), name,
-             " rowwise scale_inv must have ", product(scale_shape),
-             " entries for logical shape ", logical_shape, ", got ", grouped_output.scale_inv.shape,
-             ".");
   NVTE_CHECK(grouped_output.amax.dptr != nullptr, name, " rowwise amax must be allocated.");
-  NVTE_CHECK(grouped_output.amax.dtype == DType::kFloat32, name,
-             " rowwise amax must have Float32 dtype.");
-  NVTE_CHECK(grouped_output.amax.numel() == rows, name, " row-scaled amax must have ", rows,
-             " entries, got ", grouped_output.amax.shape, ".");
 
   Tensor output_view;
   output_view.scaling_mode = grouped_output.scaling_mode;
@@ -102,8 +73,8 @@ inline Tensor make_row_scaled_grouped_output_tensor_view(const GroupedTensor &gr
   output_view.scale_inv =
       SimpleTensor(grouped_output.scale_inv.dptr, scale_shape, grouped_output.scale_inv.dtype);
   output_view.with_gemm_swizzled_scales = grouped_output.with_gemm_swizzled_scales;
-  output_view.row_scaled_nvfp4 = grouped_output.row_scaled_nvfp4;
-  output_view.nvfp4_e4m3_max = grouped_output.nvfp4_e4m3_max;
+  output_view.row_scaled_nvfp4 = true;
+  output_view.nvfp4_e4m3_max = nvfp4_e4m3_max;
   output_view.amax =
       SimpleTensor(grouped_output.amax.dptr, std::vector<size_t>{rows}, grouped_output.amax.dtype);
   return output_view;
@@ -406,7 +377,8 @@ void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   const auto *amax_colwise_ptr = reinterpret_cast<const float *>(output->columnwise_amax.dptr);
   const auto *offsets_ptr = reinterpret_cast<const int64_t *>(output->tensor_offsets.dptr);
   const auto *noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
-  const size_t scale_stride = RETURN_ROWWISE ? group_4over6::scale_cols(cols, "last dim") : 0;
+  const size_t scale_stride =
+      RETURN_ROWWISE ? DIVUP_TO_MULTIPLE(cols / kGroupSize, static_cast<size_t>(4)) : 0;
 
   group_quantize_4over6_kernel<USE_2D_QUANTIZATION, RETURN_ROWWISE, RETURN_COLUMNWISE, Cfg,
                                E4M3_MAX, IType>
@@ -559,9 +531,6 @@ inline void group_quantize_row_scaled_4over6(const Tensor &input, Tensor *output
              "Fused grouped 4over6 quantization does not support 2D quantization.");
   NVTE_CHECK(input.flat_last_dim() % kGroupSize == 0,
              "Fused grouped 4over6 quantization requires last dim divisible by ", kGroupSize, ".");
-  const size_t rows = input.flat_first_dim();
-  NVTE_CHECK(output->amax.numel() == rows, "Row-scaled rowwise amax must have ", rows,
-             " entries, got ", output->amax.shape, ".");
 
   Tensor dummy_tensor;
   const Tensor *noop = &dummy_tensor;
@@ -570,7 +539,7 @@ inline void group_quantize_row_scaled_4over6(const Tensor &input, Tensor *output
   }
 
   TRANSFORMER_ENGINE_NVFP4_4OVER6_E4M3_MAX_SWITCH(
-      output->nvfp4_e4m3_max, E4M3_MAX,
+      quant_config->nvfp4_e4m3_max, E4M3_MAX,
       TRANSFORMER_ENGINE_NVFP4_4OVER6_MODE_SWITCH(
           quant_config->nvfp4_4over6_mode, MODE,
           TRANSFORMER_ENGINE_SWITCH_CONDITION(
@@ -595,20 +564,13 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   using namespace quantize_4over6_kernel;
 
   checkCuDriverContext(stream);
+  // 4over6 mode, stochastic rounding, row-scaled vs. not, input/output data
+  // presence, and the compact-scale layout are already enforced by the grouped
+  // dispatch in quantize.cuh before this point; only checks unique to this entry
+  // point remain.
+  NVTE_CHECK(quant_config != nullptr, "Grouped NVFP4 4over6 quantization requires a config.");
   NVTE_CHECK(input->num_tensors == output->num_tensors,
              "Number of input and output tensors must be same.");
-  NVTE_CHECK(quant_config != nullptr &&
-                 quant_config->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled,
-             "Grouped NVFP4 4over6 quantization requires a non-disabled 4over6 mode.");
-  NVTE_CHECK(!quant_config->stochastic_rounding,
-             "Grouped NVFP4 4over6 quantization does not support stochastic rounding.");
-  NVTE_CHECK(!output->row_scaled_nvfp4,
-             "Use group_quantize_row_scaled_4over6 for row-scaled grouped 4over6.");
-  NVTE_CHECK(input->has_data(), "Grouped NVFP4 4over6 quantization requires rowwise input data.");
-  NVTE_CHECK(output->has_data() || output->has_columnwise_data(),
-             "Grouped NVFP4 4over6 quantization requires rowwise or columnwise output data.");
-  NVTE_CHECK(!output->with_gemm_swizzled_scales,
-             "Grouped NVFP4 4over6 quantization requires compact scale layout.");
 
   const auto logical_shape = group_4over6::logical_shape_2d(*input, "Grouped quantize input");
   NVTE_CHECK(output->logical_shape.ndim == 2 &&
@@ -616,54 +578,31 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
                  output->logical_shape.data[1] == logical_shape[1],
              "Grouped NVFP4 4over6 input and output logical shapes must match.");
   const size_t rows = logical_shape[0];
-  const size_t cols = logical_shape[1];
   const bool return_rowwise = output->has_data();
   const bool return_columnwise = output->has_columnwise_data();
   const bool use_2d_quantization = quant_config->nvfp4_2d_quantization;
   NVTE_CHECK(!use_2d_quantization || return_rowwise,
              "Grouped NVFP4 4over6 2D quantization requires rowwise output.");
 
-  NVTE_CHECK(input->data.numel() == rows * cols,
-             "Grouped NVFP4 4over6 input rowwise data has wrong size.");
   if (return_rowwise) {
-    NVTE_CHECK(output->data.numel() == rows * cols / 2,
-               "Grouped NVFP4 4over6 output rowwise data has wrong packed size.");
     NVTE_CHECK(output->scale_inv.dptr != nullptr,
                "Grouped NVFP4 4over6 quantization requires rowwise scale_inv.");
-    NVTE_CHECK(output->scale_inv.dtype == DType::kFloat8E4M3,
-               "Grouped NVFP4 4over6 rowwise scale_inv must have Float8E4M3 dtype.");
-    NVTE_CHECK(output->scale_inv.numel() ==
-                   product(group_4over6::make_scale_shape(rows, cols, "last dim")),
-               "Grouped NVFP4 4over6 rowwise scale_inv has wrong size.");
     NVTE_CHECK(is_fp4_dtype(output->data.dtype),
                "Grouped NVFP4 4over6 rowwise output must have FP4 type.");
     NVTE_CHECK(output->amax.dptr != nullptr,
                "Grouped NVFP4 4over6 rowwise quantization requires per-tensor amax.");
-    NVTE_CHECK(output->amax.numel() == output->num_tensors,
-               "Grouped NVFP4 4over6 rowwise quantization requires one amax per tensor.");
   }
   if (return_columnwise) {
     NVTE_CHECK(rows % kGroupSize == 0,
                "Grouped NVFP4 4over6 columnwise quantization requires first dim divisible by ",
                kGroupSize, ".");
-    NVTE_CHECK(output->columnwise_data.numel() == rows * cols / 2,
-               "Grouped NVFP4 4over6 output columnwise data has wrong packed size.");
     NVTE_CHECK(output->columnwise_scale_inv.dptr != nullptr,
                "Grouped NVFP4 4over6 quantization requires columnwise scale_inv.");
-    NVTE_CHECK(output->columnwise_scale_inv.dtype == DType::kFloat8E4M3,
-               "Grouped NVFP4 4over6 columnwise scale_inv must have Float8E4M3 dtype.");
-    NVTE_CHECK(output->columnwise_scale_inv.numel() ==
-                   product(group_4over6::make_scale_shape(cols, rows, "first dim")),
-               "Grouped NVFP4 4over6 columnwise scale_inv has wrong size.");
     NVTE_CHECK(is_fp4_dtype(output->columnwise_data.dtype),
                "Grouped NVFP4 4over6 columnwise output must have FP4 type.");
     NVTE_CHECK(output->columnwise_amax.dptr != nullptr || output->amax.dptr != nullptr,
                "Grouped NVFP4 4over6 columnwise quantization requires columnwise amax or "
                "rowwise amax.");
-    if (output->columnwise_amax.dptr != nullptr) {
-      NVTE_CHECK(output->columnwise_amax.numel() == output->num_tensors,
-                 "Grouped NVFP4 4over6 columnwise quantization requires one amax per tensor.");
-    }
   }
 
   const ShapeRepresentation shape_rep = group_4over6::shape_representation(*output);
@@ -695,7 +634,7 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   }
 
   TRANSFORMER_ENGINE_NVFP4_4OVER6_E4M3_MAX_SWITCH(
-      output->nvfp4_e4m3_max, E4M3_MAX,
+      quant_config->nvfp4_e4m3_max, E4M3_MAX,
       TRANSFORMER_ENGINE_NVFP4_4OVER6_MODE_SWITCH(
           quant_config->nvfp4_4over6_mode, MODE,
           TRANSFORMER_ENGINE_SWITCH_CONDITION(

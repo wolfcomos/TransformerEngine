@@ -510,19 +510,6 @@ struct GroupedTensor {
    */
   bool with_gemm_swizzled_scales = false;
 
-  /*! \brief Whether NVFP4 rowwise amax metadata is row-scaled.
-   *
-   *  Only meaningful for NVFP4 grouped tensors.
-   */
-  bool row_scaled_nvfp4 = false;
-
-  /*! \brief Global E4M3 scale bound used by NVFP4.
-   *
-   *  Standard NVFP4 uses 448. Some 4over6 tensors use 256 to leave room for
-   *  map-to-4 local scale expansion.
-   */
-  int nvfp4_e4m3_max = 448;
-
   /*! Map from NVTEGroupedTensorParam to parameter sizes */
   static constexpr size_t attr_sizes[] = {
       sizeof(NVTEBasicTensor),  // kNVTEGroupedRowwiseData
@@ -535,9 +522,7 @@ struct GroupedTensor {
       sizeof(NVTEBasicTensor),  // kNVTEGroupedFirstDims
       sizeof(NVTEBasicTensor),  // kNVTEGroupedLastDims
       sizeof(NVTEBasicTensor),  // kNVTEGroupedTensorOffsets
-      sizeof(uint8_t),          // kNVTEGroupedWithGEMMSwizzledScales
-      sizeof(uint8_t),          // kNVTEGroupedRowScaledNVFP4
-      sizeof(int)               // kNVTEGroupedNVFP4E4M3Max
+      sizeof(uint8_t)           // kNVTEGroupedWithGEMMSwizzledScales
   };
 
   GroupedTensor(NVTEScalingMode scaling_mode, size_t num_tensors)
@@ -555,9 +540,7 @@ struct GroupedTensor {
         tensor_offsets(nullptr, std::vector<size_t>{0}, DType::kInt64),
         logical_shape(nvte_make_shape(nullptr, 1)),
         nvte_tensor(0),
-        with_gemm_swizzled_scales(false),
-        row_scaled_nvfp4(false),
-        nvfp4_e4m3_max(448) {}
+        with_gemm_swizzled_scales(false) {}
 
   explicit operator NVTEGroupedTensor() const noexcept { return nvte_tensor; }
 
@@ -623,6 +606,8 @@ struct QuantizationConfig {
   bool use_fast_math = false;
   NVTENVFP44Over6Mode nvfp4_4over6_mode = kNVTENVFP44Over6Disabled;
   bool nvfp4_4over6_err_use_fast_math = false;
+  bool nvfp4_row_scaled = false;
+  int nvfp4_e4m3_max = 448;
 
   static constexpr size_t attr_sizes[] = {
       sizeof(uint8_t),                       // force_pow_2_scales
@@ -634,7 +619,9 @@ struct QuantizationConfig {
       sizeof(uint8_t),                       // stochastic_rounding
       sizeof(uint8_t),                       // use_fast_math
       sizeof(uint8_t),                       // nvfp4_4over6_mode
-      sizeof(uint8_t)                        // nvfp4_4over6_err_use_fast_math
+      sizeof(uint8_t),                       // nvfp4_4over6_err_use_fast_math
+      sizeof(uint8_t),                       // nvfp4_row_scaled
+      sizeof(int)                            // nvfp4_e4m3_max
   };
 };
 
