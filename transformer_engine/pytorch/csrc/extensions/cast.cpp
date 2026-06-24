@@ -43,26 +43,6 @@ void allreduce_nvfp4_amax_tensors(NVFP4Quantizer *nvfp4_quantizer_cpp,
   });
 }
 
-QuantizationConfigWrapper make_nvfp4_quant_config(const NVFP4Quantizer &quantizer) {
-  QuantizationConfigWrapper quant_config;
-  quant_config.set_nvfp4_4over6_mode(quantizer.nvfp4_4over6_mode);
-  quant_config.set_nvfp4_2d_quantization(quantizer.with_2d_quantization);
-  quant_config.set_nvfp4_row_scaled(quantizer.row_scaled_nvfp4);
-  quant_config.set_nvfp4_e4m3_max(quantizer.nvfp4_e4m3_max);
-
-  const auto use_fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
-  if (use_fast_math && quantizer.nvfp4_4over6_mode == kNVTENVFP44Over6Disabled) {
-    quant_config.set_use_fast_math(true);
-  }
-
-  const auto use_4over6_err_use_fast_math =
-      transformer_engine::getenv<bool>("NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH");
-  if (use_4over6_err_use_fast_math) {
-    quant_config.set_nvfp4_4over6_err_use_fast_math(true);
-  }
-  return quant_config;
-}
-
 }  // namespace
 
 py::object quantize(const at::Tensor &tensor, py::handle quantizer, const py::object &output,
@@ -167,6 +147,22 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
   const bool row_scaled_nvfp4 = nvfp4_quantizer_cpp->row_scaled_nvfp4;
   const bool nvfp4_use_4over6 =
       nvfp4_quantizer_cpp->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
+  QuantizationConfigWrapper quant_config_cpp;
+  quant_config_cpp.set_nvfp4_4over6_mode(nvfp4_quantizer_cpp->nvfp4_4over6_mode);
+  quant_config_cpp.set_nvfp4_2d_quantization(nvfp4_quantizer_cpp->with_2d_quantization);
+  quant_config_cpp.set_nvfp4_row_scaled(row_scaled_nvfp4);
+  quant_config_cpp.set_nvfp4_e4m3_max(nvfp4_quantizer_cpp->nvfp4_e4m3_max);
+
+  const auto use_fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
+  if (use_fast_math && !nvfp4_use_4over6) {
+    quant_config_cpp.set_use_fast_math(true);
+  }
+
+  const auto use_4over6_err_use_fast_math =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH");
+  if (use_4over6_err_use_fast_math) {
+    quant_config_cpp.set_nvfp4_4over6_err_use_fast_math(true);
+  }
 
   NVTE_CHECK(!nvfp4_quantizer_cpp->with_2d_quantization || nvfp4_use_4over6,
              "2D scaling grouped NVFP4 quantization is only supported with a 4over6 mode.");
@@ -180,7 +176,6 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
     NVTE_CHECK(!nvfp4_quantizer_cpp->with_amax_reduction,
                "Row-scaled NVFP4 grouped quantization does not support amax reduction.");
 
-    auto quant_config_cpp = make_nvfp4_quant_config(*nvfp4_quantizer_cpp);
     // Row-scaled NVFP4 grouped quantization always uses the fused single-launch
     // kernel (fused per-row amax + 4over6 candidate selection).
     NVTE_SCOPED_GIL_RELEASE({
@@ -201,7 +196,6 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
                "Grouped NVFP4 4over6 amax computation currently supports BF16 input only. "
                "Use nvfp4_group_quantize_with_amax for precomputed amax with other dtypes.");
 
-    auto quant_config_cpp = make_nvfp4_quant_config(*nvfp4_quantizer_cpp);
     NVTE_SCOPED_GIL_RELEASE({
       // TODO: Support non-128-aligned splits in the graph-safe grouped amax path.
       // The current graph-safe grouped amax computes one amax per 128-row tile, so callers
@@ -221,8 +215,6 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
              "graph safe grouped quant kernel for non-RHT path is not ready yet");
   NVTE_CHECK(nvfp4_quantizer_cpp->with_post_rht_amax,
              "grouped NVFP4 RHT quantization expects post-RHT amax buffers.");
-
-  auto quant_config_cpp = QuantizationConfigWrapper();
 
   // stochastic rounding
   bool need_stochastic_rounding = nvfp4_quantizer_cpp->stochastic_rounding;
@@ -246,7 +238,6 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
   }
 
   // fast math
-  const auto use_fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
   if (use_fast_math) {
     quant_config_cpp.set_use_fast_math(true);
   }
