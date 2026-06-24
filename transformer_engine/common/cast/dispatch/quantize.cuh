@@ -483,13 +483,7 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
         NVTE_CHECK(!output_tensor->has_columnwise_data(),
                    "Row-scaled grouped NVFP4 4over6 quantization does not support columnwise "
                    "output.");
-        Tensor input_view =
-            nvfp4::group_4over6::make_grouped_input_tensor_view(*input_tensor,
-                                                                "Grouped quantize input");
-        Tensor output_view =
-            nvfp4::group_4over6::make_row_scaled_grouped_output_tensor_view(
-                *output_tensor, "Grouped quantize output", quant_config_cpp.nvfp4_e4m3_max);
-        nvfp4::group_quantize_row_scaled_4over6(input_view, &output_view, &quant_config_cpp,
+        nvfp4::group_quantize_row_scaled_4over6(input_tensor, output_tensor, &quant_config_cpp,
                                                 stream);
       } else {
         nvfp4::group_quantize_4over6(input_tensor, output_tensor, &quant_config_cpp, stream);

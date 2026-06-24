@@ -995,15 +995,10 @@ class GroupedTensorStorage:
         recipe = self.quantizer._get_compatible_recipe()
 
         row_scaled_nvfp4 = recipe.nvfp4() and self.row_scaled_nvfp4
-        explicit_scale_inv_offsets = self.scale_inv_offsets is not None
 
         # populate scale_inv_offsets from the tensor offsets
         if self.scale_inv is not None and self.scale_inv_offsets is None:
-            if (
-                (recipe.nvfp4() and not row_scaled_nvfp4)
-                or recipe.mxfp8()
-                or recipe.float8_block_scaling()
-            ):
+            if recipe.nvfp4() or recipe.mxfp8() or recipe.float8_block_scaling():
                 cum = 0
                 scale_inv_offsets = [0]
                 for i in range(self.num_tensors):
@@ -1201,33 +1196,12 @@ class GroupedTensorStorage:
                 amax_columnwise = None
 
                 if self.scale_inv is not None:
-                    scale_shape = quantizer.get_scale_shape(tensor_shape, False)
-                    if row_scaled_nvfp4 and not explicit_scale_inv_offsets:
-                        # Fused row-scaled NVFP4 stores scales in one compact
-                        # global row-major matrix, without per-split row padding.
-                        rows = math.prod(tensor_shape[:-1])
-                        row_start = nvfp4_rowwise_amax_offsets[i]
-                        grouped_scale_shape = quantizer.get_scale_shape(
-                            self.logical_shape, False
-                        )
-                        grouped_scale_inv = self.scale_inv.view(grouped_scale_shape)
-                        rowwise_scale_inv = torch.empty(
-                            scale_shape,
-                            dtype=self.scale_inv.dtype,
-                            device=self.scale_inv.device,
-                        )
-                        rowwise_scale_inv.zero_()
-                        rowwise_scale_inv[:rows, :].copy_(
-                            grouped_scale_inv[
-                                row_start : row_start + rows,
-                                : scale_shape[1],
-                            ]
-                        )
-                    elif self.scale_inv_offsets is not None:
+                    if self.scale_inv_offsets is not None:
                         scale_start = self.scale_inv_offsets[i]
                         # for paged stashing, scale_inv should depend on the split offsets
                         scale_end = self.scale_inv_offsets[i + 1]
 
+                        scale_shape = quantizer.get_scale_shape(tensor_shape, False)
                         rowwise_scale_inv = self.scale_inv[scale_start:scale_end].view(
                             scale_shape
                         )

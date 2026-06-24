@@ -244,12 +244,8 @@ def test_grouped_nvfp4_4over6_quantize_matches_split_nvfp4_4over6(case: dict) ->
 
     if return_rowwise:
         packed_offset = 0
-        row_offset = 0
-        scale_rows = ((rows + 127) // 128) * 128
         scale_cols = (((hidden // 16) + 3) // 4) * 4
-        grouped_scales = grouped.scale_inv.contiguous().view(torch.uint8).reshape(
-            scale_rows, scale_cols
-        )
+        scale_offset = 0
         for split, ref in zip(splits, refs):
             packed_elems = split * hidden // 2
             torch.testing.assert_close(
@@ -259,17 +255,21 @@ def test_grouped_nvfp4_4over6_quantize_matches_split_nvfp4_4over6(case: dict) ->
                 rtol=0,
             )
             split_scale_rows = ((split + 127) // 128) * 128
+            scale_elems = split_scale_rows * scale_cols
+            grouped_scales = grouped.scale_inv[
+                scale_offset : scale_offset + scale_elems
+            ].view(torch.uint8).reshape(split_scale_rows, scale_cols)
             valid_ref_scales = ref._rowwise_scale_inv.view(torch.uint8).reshape(
                 split_scale_rows, scale_cols
             )[:split, : hidden // 16]
             torch.testing.assert_close(
-                grouped_scales[row_offset : row_offset + split, : hidden // 16].reshape(-1),
+                grouped_scales[:split, : hidden // 16].reshape(-1),
                 valid_ref_scales.reshape(-1),
                 atol=0,
                 rtol=0,
             )
             packed_offset += packed_elems
-            row_offset += split
+            scale_offset += scale_elems
 
         torch.testing.assert_close(grouped.amax, expected_amax, atol=0, rtol=0)
 
