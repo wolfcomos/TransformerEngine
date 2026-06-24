@@ -165,9 +165,18 @@ def _quant_path(path: str, stats: QuantPathStats):
         split_list = _split_sections_to_list(split_sections)
         quantizer = _check_group_quant_supported(tensor, split_list, list(quantizers))
         split_tensor = torch.tensor(split_list, dtype=torch.int64, device=tensor.device)
-        grouped = tex.group_quantize(tensor, quantizer, len(split_list), split_tensor)
-        stats.group_quantize_calls += 1
-        return grouped.split_into_quantized_tensors()
+        old_optimize_for_gemm = quantizer.optimize_for_gemm
+        # TODO: Grouped NVFP4 4over6 currently emits compact scales only. GroupedLinear sets
+        # optimize_for_gemm=True, which marks grouped tensors as GEMM-swizzled before the grouped
+        # 4over6 path can run. Keep this benchmark on compact scales until TE defines the grouped
+        # 4over6 + GEMM-swizzled scale layout policy.
+        quantizer.optimize_for_gemm = False
+        try:
+            grouped = tex.group_quantize(tensor, quantizer, len(split_list), split_tensor)
+            stats.group_quantize_calls += 1
+            return grouped.split_into_quantized_tensors()
+        finally:
+            quantizer.optimize_for_gemm = old_optimize_for_gemm
 
     tex.split_quantize = split_path if path == "split" else group_path
     try:

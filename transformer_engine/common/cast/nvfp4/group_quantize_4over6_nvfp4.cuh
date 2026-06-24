@@ -14,7 +14,6 @@
 #include <transformer_engine/transformer_engine.h>
 
 #include <cstdint>
-#include <vector>
 
 #include "../../common.h"
 #include "../../util/cuda_runtime.h"
@@ -30,21 +29,6 @@ namespace nvfp4 {
 namespace group_4over6 {
 
 constexpr size_t kGroupSize = 16;
-
-inline std::vector<size_t> logical_shape_2d(const GroupedTensor &tensor, const char *name) {
-  NVTE_CHECK(tensor.num_tensors > 0, name, " must contain at least one tensor.");
-  NVTE_CHECK(tensor.logical_shape.ndim == 2, name, " must have 2D logical shape.");
-  NVTE_CHECK(tensor.logical_shape.data[1] > 0, name, " must have positive last dimension.");
-  return std::vector<size_t>{tensor.logical_shape.data[0], tensor.logical_shape.data[1]};
-}
-
-inline ShapeRepresentation shape_representation(const GroupedTensor &tensor) {
-  if (tensor.all_same_shape()) return ShapeRepresentation::SAME_BOTH_DIMS;
-  if (tensor.all_same_first_dim()) return ShapeRepresentation::VARYING_LAST_DIM;
-  if (tensor.all_same_last_dim()) return ShapeRepresentation::VARYING_FIRST_DIM;
-  if (tensor.varying_both_dims()) return ShapeRepresentation::VARYING_BOTH_DIMS;
-  NVTE_ERROR("Invalid grouped tensor shape representation.");
-}
 
 // Resolves per-tensor geometry for a grouped tensor stored as a single logical
 // [rows, cols] buffer. With `has_first_dims == false` every tensor owns the same
@@ -520,11 +504,9 @@ inline void group_quantize_row_scaled_4over6(const GroupedTensor *input, Grouped
              "Fused grouped 4over6 quantization requires matching input/output logical shapes.");
   NVTE_CHECK(input->logical_shape.data[1] % kGroupSize == 0,
              "Fused grouped 4over6 quantization requires last dim divisible by ", kGroupSize, ".");
-  const ShapeRepresentation shape_rep = group_4over6::shape_representation(*output);
-  NVTE_CHECK(shape_rep == ShapeRepresentation::SAME_BOTH_DIMS ||
-                 shape_rep == ShapeRepresentation::VARYING_FIRST_DIM,
+  NVTE_CHECK(!output->last_dims.has_data(),
              "Fused grouped 4over6 quantization currently requires a constant last dimension.");
-  NVTE_CHECK(shape_rep != ShapeRepresentation::SAME_BOTH_DIMS ||
+  NVTE_CHECK(output->first_dims.has_data() ||
                  input->logical_shape.data[0] % output->num_tensors == 0,
              "Fused grouped 4over6 quantization requires rows divisible by num_tensors when "
              "first_dims are not provided.");
@@ -569,12 +551,12 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   NVTE_CHECK(input->num_tensors == output->num_tensors,
              "Number of input and output tensors must be same.");
 
-  const auto logical_shape = group_4over6::logical_shape_2d(*input, "Grouped quantize input");
-  NVTE_CHECK(output->logical_shape.ndim == 2 &&
-                 output->logical_shape.data[0] == logical_shape[0] &&
-                 output->logical_shape.data[1] == logical_shape[1],
+  NVTE_CHECK(input->logical_shape.ndim == 2 && output->logical_shape.ndim == 2,
+             "Grouped NVFP4 4over6 quantization requires 2D grouped tensors.");
+  NVTE_CHECK(output->logical_shape.data[0] == input->logical_shape.data[0] &&
+                 output->logical_shape.data[1] == input->logical_shape.data[1],
              "Grouped NVFP4 4over6 input and output logical shapes must match.");
-  const size_t rows = logical_shape[0];
+  const size_t rows = input->logical_shape.data[0];
   const bool return_rowwise = output->has_data();
   const bool return_columnwise = output->has_columnwise_data();
   const bool use_2d_quantization = quant_config->nvfp4_2d_quantization;
@@ -602,24 +584,20 @@ inline void group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
                "rowwise amax.");
   }
 
-  const ShapeRepresentation shape_rep = group_4over6::shape_representation(*output);
-  NVTE_CHECK(shape_rep == ShapeRepresentation::SAME_BOTH_DIMS ||
-                 shape_rep == ShapeRepresentation::VARYING_FIRST_DIM,
+  const bool has_first_dims = output->first_dims.has_data();
+  NVTE_CHECK(!output->last_dims.has_data(),
              "Grouped NVFP4 4over6 quantization currently requires a constant last dimension.");
-  NVTE_CHECK(shape_rep != ShapeRepresentation::SAME_BOTH_DIMS || rows % output->num_tensors == 0,
+  NVTE_CHECK(has_first_dims || rows % output->num_tensors == 0,
              "Grouped NVFP4 4over6 quantization requires rows divisible by num_tensors when "
              "first_dims are not provided.");
-  NVTE_CHECK(shape_rep != ShapeRepresentation::SAME_BOTH_DIMS || !return_columnwise ||
-                 (rows / output->num_tensors) % kGroupSize == 0,
+  NVTE_CHECK(has_first_dims || !return_columnwise || (rows / output->num_tensors) % kGroupSize == 0,
              "Grouped NVFP4 4over6 columnwise quantization requires each tensor first dim "
              "divisible by ",
              kGroupSize, " when first_dims are not provided.");
-  NVTE_CHECK(shape_rep != ShapeRepresentation::VARYING_FIRST_DIM || output->tensor_offsets.dptr,
-             "Grouped NVFP4 4over6 quantization requires tensor_offsets for varying first dims.");
   NVTE_CHECK(!use_2d_quantization || rows % kGroupSize == 0,
              "Grouped NVFP4 4over6 2D quantization requires first dim divisible by ", kGroupSize,
              ".");
-  NVTE_CHECK(!use_2d_quantization || shape_rep != ShapeRepresentation::SAME_BOTH_DIMS ||
+  NVTE_CHECK(!use_2d_quantization || has_first_dims ||
                  (rows / output->num_tensors) % kGroupSize == 0,
              "Grouped NVFP4 4over6 2D quantization requires each tensor first dim divisible by ",
              kGroupSize, " when first_dims are not provided.");
