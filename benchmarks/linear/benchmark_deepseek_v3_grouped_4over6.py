@@ -75,6 +75,16 @@ def _make_recipe(recipe_name: str) -> te_recipe.NVFP4BlockScaling:
         backward_override="high_precision",
     )
 
+    if recipe_name == "tensor_scaled_1d":
+        recipe = te_recipe.NVFP4BlockScaling(
+            **common,
+            disable_2d_quantization=True,
+        )
+        recipe.fp4_quant_fwd_inp = te_recipe.QParams()
+        recipe.fp4_quant_fwd_weight = te_recipe.QParams()
+        recipe.fp4_quant_bwd_grad = te_recipe.QParams()
+        return recipe
+
     if recipe_name == "tensor_scaled_2d":
         recipe = te_recipe.NVFP4BlockScaling(**common)
         recipe.fp4_quant_fwd_inp = te_recipe.QParams(fp4_2d_quantization=True)
@@ -302,7 +312,9 @@ def main() -> None:
     parser.add_argument("--num-gemms", type=int, default=8)
     parser.add_argument("--splits", type=str, default=None)
     parser.add_argument(
-        "--recipe", choices=["tensor_scaled_2d", "row_scaled_1d", "all"], default="all"
+        "--recipe",
+        choices=["tensor_scaled_1d", "tensor_scaled_2d", "row_scaled_1d", "all"],
+        default="all",
     )
     parser.add_argument("--path", choices=["split", "group", "all"], default="all")
     parser.add_argument("--fwd-only", action="store_true")
@@ -323,7 +335,11 @@ def main() -> None:
 
     os.environ.setdefault("NVTE_GROUPED_LINEAR_USE_FUSED_GROUPED_GEMM", "1")
     splits = _parse_splits(args.splits, args.m, args.num_gemms)
-    recipes = ["tensor_scaled_2d", "row_scaled_1d"] if args.recipe == "all" else [args.recipe]
+    recipes = (
+        ["tensor_scaled_1d", "tensor_scaled_2d", "row_scaled_1d"]
+        if args.recipe == "all"
+        else [args.recipe]
+    )
     paths = ["split", "group"] if args.path == "all" else [args.path]
 
     rows = []
