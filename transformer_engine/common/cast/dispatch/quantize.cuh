@@ -468,8 +468,6 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
       NVTE_CHECK(nvfp4_use_4over6,
                  "Grouped NVFP4 quantization through native grouped dispatch currently supports "
                  "only 4over6 recipe tensors.");
-      NVTE_CHECK(!quant_config_cpp.nvfp4_2d_quantization,
-                 "Grouped NVFP4 4over6 quantization currently supports 1D quantization only.");
       NVTE_CHECK(!quant_config_cpp.stochastic_rounding,
                  "Grouped NVFP4 4over6 quantization does not support stochastic rounding.");
       NVTE_CHECK(input_tensor->has_data(),
