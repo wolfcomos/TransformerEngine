@@ -144,18 +144,74 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
                                NVFP4Quantizer *nvfp4_quantizer_cpp, cudaStream_t stream,
                                bool compute_amax) {
   size_t num_tensors = grouped_input_tensor.num_tensors();
+  const bool row_scaled_nvfp4 = nvfp4_quantizer_cpp->row_scaled_nvfp4;
+  const bool nvfp4_use_4over6 =
+      nvfp4_quantizer_cpp->nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
+  QuantizationConfigWrapper quant_config_cpp;
+  quant_config_cpp.set_nvfp4_4over6_mode(nvfp4_quantizer_cpp->nvfp4_4over6_mode);
+  quant_config_cpp.set_nvfp4_2d_quantization(nvfp4_quantizer_cpp->with_2d_quantization);
+  quant_config_cpp.set_nvfp4_row_scaled(row_scaled_nvfp4);
+  quant_config_cpp.set_nvfp4_e4m3_max(nvfp4_quantizer_cpp->nvfp4_e4m3_max);
 
-  // assert the 2D scaling case, since 2D scaling grouped quant kernel is not ready yet
-  NVTE_CHECK(!nvfp4_quantizer_cpp->with_2d_quantization,
-             "2D scaling grouped quant kernel is not ready yet");
-  NVTE_CHECK(nvfp4_quantizer_cpp->nvfp4_4over6_mode == kNVTENVFP44Over6Disabled,
-             "NVFP4 4over6 quantization is not supported for grouped quantization.");
+  const auto use_fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
+  if (use_fast_math && !nvfp4_use_4over6) {
+    quant_config_cpp.set_use_fast_math(true);
+  }
+
+  const auto use_4over6_err_use_fast_math =
+      transformer_engine::getenv<bool>("NVTE_NVFP4_4OVER6_ERR_USE_FAST_MATH");
+  if (use_4over6_err_use_fast_math) {
+    quant_config_cpp.set_nvfp4_4over6_err_use_fast_math(true);
+  }
+
+  NVTE_CHECK(!nvfp4_quantizer_cpp->with_2d_quantization || nvfp4_use_4over6,
+             "2D scaling grouped NVFP4 quantization is only supported with a 4over6 mode.");
+  if (row_scaled_nvfp4) {
+    NVTE_CHECK(nvfp4_use_4over6,
+               "Row-scaled NVFP4 grouped quantization is only supported with a 4over6 mode.");
+    NVTE_CHECK(!nvfp4_quantizer_cpp->with_rht,
+               "Row-scaled NVFP4 grouped quantization does not support RHT.");
+    NVTE_CHECK(!nvfp4_quantizer_cpp->stochastic_rounding,
+               "Row-scaled NVFP4 grouped quantization does not support stochastic rounding.");
+    NVTE_CHECK(!nvfp4_quantizer_cpp->with_amax_reduction,
+               "Row-scaled NVFP4 grouped quantization does not support amax reduction.");
+
+    // Row-scaled NVFP4 grouped quantization always uses the fused single-launch
+    // kernel (fused per-row amax + 4over6 candidate selection).
+    NVTE_SCOPED_GIL_RELEASE({
+      nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor.data(),
+                          quant_config_cpp, stream);
+    });
+    return;
+  }
+
+  if (nvfp4_use_4over6) {
+    NVTE_CHECK(!nvfp4_quantizer_cpp->with_rht,
+               "Grouped NVFP4 4over6 quantization does not support RHT.");
+    NVTE_CHECK(!nvfp4_quantizer_cpp->stochastic_rounding,
+               "Grouped NVFP4 4over6 quantization does not support stochastic rounding.");
+    NVTE_CHECK(!nvfp4_quantizer_cpp->with_amax_reduction,
+               "Grouped NVFP4 4over6 quantization does not support amax reduction.");
+    NVTE_CHECK(!compute_amax || grouped_input_tensor.dtype() == DType::kBFloat16,
+               "Grouped NVFP4 4over6 amax computation currently supports BF16 input only. "
+               "Use nvfp4_group_quantize_with_amax for precomputed amax with other dtypes.");
+
+    NVTE_SCOPED_GIL_RELEASE({
+      // TODO: Support non-128-aligned splits in the graph-safe grouped amax path.
+      if (compute_amax) {
+        nvte_group_amax_graph_safe(grouped_input_tensor.data(), grouped_output_tensor.data(),
+                                   stream);
+      }
+      nvte_group_quantize(grouped_input_tensor.data(), grouped_output_tensor.data(),
+                          quant_config_cpp, stream);
+    });
+    return;
+  }
+
   NVTE_CHECK(nvfp4_quantizer_cpp->with_rht,
              "graph safe grouped quant kernel for non-RHT path is not ready yet");
   NVTE_CHECK(nvfp4_quantizer_cpp->with_post_rht_amax,
              "grouped NVFP4 RHT quantization expects post-RHT amax buffers.");
-
-  auto quant_config_cpp = QuantizationConfigWrapper();
 
   // stochastic rounding
   bool need_stochastic_rounding = nvfp4_quantizer_cpp->stochastic_rounding;
@@ -179,7 +235,6 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
   }
 
   // fast math
-  const auto use_fast_math = transformer_engine::getenv<bool>("NVTE_USE_FAST_MATH");
   if (use_fast_math) {
     quant_config_cpp.set_use_fast_math(true);
   }

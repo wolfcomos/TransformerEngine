@@ -20,6 +20,7 @@
 #include "../fp8/quantize_fp8.cuh"
 #include "../mxfp8/group_quantize_mxfp8.cuh"
 #include "../mxfp8/quantize_mxfp8.cuh"
+#include "../nvfp4/group_quantize_4over6_nvfp4.cuh"
 #include "../nvfp4/group_quantize_transpose_nvfp4.cuh"
 #include "../nvfp4/quantize_4over6_nvfp4.cuh"
 #include "../nvfp4/quantize_transpose_nvfp4.cuh"
@@ -405,7 +406,8 @@ void group_quantize_fwd_host_aware_helper(const NVTETensor input, NVTETensor *ou
       NVTE_CHECK(!quant_config_cpp.nvfp4_2d_quantization,
                  "2D quantization is not supported for group quantize.");
       NVTE_CHECK(!nvfp4_use_4over6,
-                 "NVFP4 4over6 quantization is not supported for group quantize.");
+                 "NVFP4 4over6 quantization is supported through native grouped dispatch, "
+                 "not the host-aware split-section group quantize path.");
 
       // Launch NVFP4 group quantize kernel
       nvfp4::group_quantize_transpose</*use_2d_quantization*/ false>(
@@ -454,6 +456,33 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
       mxfp8::group_quantize</*IS_DBIAS=*/false, /*IS_DACT=*/false, IS_ACT, ParamOP, OP>(
           input_tensor, activations_tensor, noop_tensor, output_tensor, dbias_tensor,
           workspace_tensor, &quant_config_cpp, stream);
+      break;
+    }
+    case NVTE_NVFP4_1D_SCALING: {
+      NVTE_CHECK(!IS_ACT, "IS_ACT is not supported by grouped FWD NVTE_NVFP4_1D_SCALING");
+
+      CheckNoopTensor(*noop_tensor, "cast_noop");
+
+      const bool nvfp4_use_4over6 =
+          quant_config_cpp.nvfp4_4over6_mode != kNVTENVFP44Over6Disabled;
+      NVTE_CHECK(nvfp4_use_4over6,
+                 "Grouped NVFP4 quantization through native grouped dispatch currently supports "
+                 "only 4over6 recipe tensors.");
+      NVTE_CHECK(!quant_config_cpp.stochastic_rounding,
+                 "Grouped NVFP4 4over6 quantization does not support stochastic rounding.");
+      NVTE_CHECK(input_tensor->has_data(),
+                 "Grouped NVFP4 4over6 input rowwise data must be allocated.");
+      NVTE_CHECK(output_tensor->has_data() || output_tensor->has_columnwise_data(),
+                 "Grouped NVFP4 4over6 output rowwise or columnwise data must be allocated.");
+      NVTE_CHECK(!output_tensor->with_gemm_swizzled_scales,
+                 "Grouped NVFP4 4over6 quantization requires compact scale layout.");
+
+      if (quant_config_cpp.nvfp4_row_scaled) {
+        nvfp4::group_quantize_row_scaled_4over6(input_tensor, output_tensor, &quant_config_cpp,
+                                                stream);
+      } else {
+        nvfp4::group_quantize_4over6(input_tensor, output_tensor, &quant_config_cpp, stream);
+      }
       break;
     }
     default:

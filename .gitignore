@@ -43,3 +43,13 @@ tensor_dumps/
 artifacts/
 .DS_Store
 .claude/
+.cursor/
+.env/
+
+# Local NVFP4 4over6 grouped-quant dev tooling (kept local, not part of the PR):
+# standalone C++ bit-exact/benchmark harness and the ad-hoc benchmark/compare
+# scripts. The committed coverage is the kernel + dispatch + the pytest in
+# tests/pytorch/nvfp4/test_nvfp4_group_quantize.py.
+tests/cpp/standalone_4over6_group_quantize/
+benchmarks/benchmark_4over6_group_quantize.py
+benchmarks/linear/compare_nvfp4_4over6_selection.py

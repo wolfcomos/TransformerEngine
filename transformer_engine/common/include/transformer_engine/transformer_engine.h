@@ -436,6 +436,10 @@ enum NVTEQuantizationConfigAttribute {
    *  of ordinary NVFP4 fast-math settings.
    */
   kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath = 9,
+  /*! Whether NVFP4 metadata uses per-row amax scaling */
+  kNVTEQuantizationConfigNVFP4RowScaled = 10,
+  /*! Global E4M3 scale bound used by NVFP4 */
+  kNVTEQuantizationConfigNVFP4E4M3Max = 11,
   kNVTEQuantizationConfigNumAttributes
 };
 
@@ -1483,6 +1487,20 @@ class QuantizationConfigWrapper {
     const auto val = static_cast<uint8_t>(use_fast_math);
     nvte_set_quantization_config_attribute(
         config_, kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath, &val, sizeof(val));
+  }
+
+  /*! \brief Set whether NVFP4 metadata uses per-row amax scaling */
+  void set_nvfp4_row_scaled(bool row_scaled) {
+    const auto val = static_cast<uint8_t>(row_scaled);
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigNVFP4RowScaled, &val,
+                                           sizeof(val));
+  }
+
+  /*! \brief Set global E4M3 scale bound used by NVFP4 */
+  void set_nvfp4_e4m3_max(int e4m3_max) {
+    const auto val = e4m3_max;
+    nvte_set_quantization_config_attribute(config_, kNVTEQuantizationConfigNVFP4E4M3Max, &val,
+                                           sizeof(val));
   }
 
  private:

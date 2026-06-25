@@ -314,16 +314,21 @@ void CheckGroupedTensorShapeArrays(const GroupedTensor &t, std::string_view name
                " columnwise_data must be 1D");
   }
 
-  // Validate data size matches logical_shape
+  // Validate data size matches logical_shape. FP4 packs two elements per storage
+  // unit, so the data buffer holds half as many elements as the logical shape.
   size_t expected_numel = t.logical_shape.data[0] * t.logical_shape.data[1];
   if (t.has_data()) {
-    NVTE_CHECK(t.data.numel() == expected_numel, "Grouped tensor ", name, " data size (",
-               t.data.numel(), ") must match logical_shape size (", expected_numel, ")");
+    const size_t expected_data_numel =
+        is_fp4_dtype(t.data.dtype) ? expected_numel / 2 : expected_numel;
+    NVTE_CHECK(t.data.numel() == expected_data_numel, "Grouped tensor ", name, " data size (",
+               t.data.numel(), ") must match logical_shape size (", expected_data_numel, ")");
   }
   if (t.has_columnwise_data()) {
-    NVTE_CHECK(t.columnwise_data.numel() == expected_numel, "Grouped tensor ", name,
+    const size_t expected_columnwise_numel =
+        is_fp4_dtype(t.columnwise_data.dtype) ? expected_numel / 2 : expected_numel;
+    NVTE_CHECK(t.columnwise_data.numel() == expected_columnwise_numel, "Grouped tensor ", name,
                " columnwise_data size (", t.columnwise_data.numel(),
-               ") must match logical_shape size (", expected_numel, ")");
+               ") must match logical_shape size (", expected_columnwise_numel, ")");
   }
 }
 
@@ -1050,6 +1055,12 @@ void nvte_get_quantization_config_attribute(NVTEQuantizationConfig config,
     case kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath:
       bool_to_uint8(config_.nvfp4_4over6_err_use_fast_math, buf);
       break;
+    case kNVTEQuantizationConfigNVFP4RowScaled:
+      bool_to_uint8(config_.nvfp4_row_scaled, buf);
+      break;
+    case kNVTEQuantizationConfigNVFP4E4M3Max:
+      std::memcpy(buf, &config_.nvfp4_e4m3_max, attr_size);
+      break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");
   }
@@ -1116,6 +1127,14 @@ void nvte_set_quantization_config_attribute(NVTEQuantizationConfig config,
     }
     case kNVTEQuantizationConfigNVFP44Over6ErrUseFastMath:
       uint8_to_bool(buf, config_.nvfp4_4over6_err_use_fast_math);
+      break;
+    case kNVTEQuantizationConfigNVFP4RowScaled:
+      uint8_to_bool(buf, config_.nvfp4_row_scaled);
+      break;
+    case kNVTEQuantizationConfigNVFP4E4M3Max:
+      std::memcpy(&config_.nvfp4_e4m3_max, buf, attr_size);
+      NVTE_CHECK(config_.nvfp4_e4m3_max == 448 || config_.nvfp4_e4m3_max == 256,
+                 "Unsupported NVFP4 E4M3 max (got ", config_.nvfp4_e4m3_max, ")");
       break;
     default:
       NVTE_ERROR("Unsupported NVTEQuantizationConfigAttribute (got ", static_cast<int>(attr), ")");
