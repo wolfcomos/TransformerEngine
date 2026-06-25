@@ -116,163 +116,122 @@ using namespace quantize_4over6_kernel;
 constexpr int kThreads = 256;
 
 template <bool USE_2D_QUANTIZATION, typename Cfg, int E4M3_MAX, typename IType>
-__device__ __forceinline__ void quantize_group_rowwise(
-    const IType *__restrict__ input, fp4e2m1x2 *__restrict__ output,
+__device__ void quantize_group_stage_rowwise(
+    const IType *__restrict__ tile, fp4e2m1x2 *__restrict__ output,
     nvfp4_scale_t *__restrict__ scales, const float *__restrict__ amax,
-    const group_4over6::GroupedLayout &layout, const size_t scale_stride,
-    const size_t group_idx) {
+    const group_4over6::GroupedLayout &layout, const size_t stage_row, const size_t tile_col,
+    const size_t scale_stride) {
   const size_t rows = layout.rows;
   const size_t cols = layout.cols;
-  const size_t col_groups = cols / kGroupSize;
-
-  size_t row;
-  size_t col_group;
-  size_t tensor_id;
-  if constexpr (USE_2D_QUANTIZATION) {
-    // A 16-lane tile cooperates over one kGroupSize x kGroupSize block (one row per lane).
-    const size_t lane_in_tile = group_idx % kGroupSize;
-    const size_t tile_idx = group_idx / kGroupSize;
-    col_group = tile_idx % col_groups;
-    const size_t row_start = (tile_idx / col_groups) * kGroupSize;
-    row = row_start + lane_in_tile;
-    if (row >= rows) {
-      return;
+  constexpr int groups = kStageRows * kTileColGroups;
+  for (int group = threadIdx.x; group < groups; group += blockDim.x) {
+    const int local_row = group % kStageRows;
+    const int local_col_group = group / kStageRows;
+    const int local_col = local_col_group * kGroupSize;
+    const size_t global_row = stage_row + local_row;
+    const size_t global_col = tile_col + local_col;
+    if (global_row >= rows || global_col >= cols) {
+      continue;
     }
-    tensor_id = layout.tensor_id(row_start);
-    const size_t local_row = row_start - layout.start_row(tensor_id);
-    if (local_row + kGroupSize > layout.tensor_rows(tensor_id)) {
-      return;
+
+    size_t tensor_id = layout.tensor_id(global_row);
+    if constexpr (USE_2D_QUANTIZATION) {
+      const size_t row_start = (global_row / kGroupSize) * kGroupSize;
+      tensor_id = layout.tensor_id(row_start);
+      const size_t tensor_local_row = row_start - layout.start_row(tensor_id);
+      if (tensor_local_row + kGroupSize > layout.tensor_rows(tensor_id)) {
+        continue;
+      }
     }
-  } else {
-    row = group_idx / col_groups;
-    col_group = group_idx - row * col_groups;
-    if (row >= rows) {
-      return;
+
+    float x0[kElementsPerHalfGroup];
+    float x1[kElementsPerHalfGroup];
+    float group_amax = 0.0f;
+    load_row_group(tile, local_row, local_col, x0, x1, &group_amax);
+
+    float block_amax = group_amax;
+    if constexpr (USE_2D_QUANTIZATION) {
+      // amax and the map4/map6 error are reduced across the 16-row tile.
+      block_amax = reduce_group_max_16(group_amax);
     }
-    tensor_id = layout.tensor_id(row);
-  }
 
-  const size_t col = col_group * kGroupSize;
-  const float global_amax = amax[tensor_id];
-
-  Vec<IType, kElementsPerHalfGroup> x0_vec;
-  Vec<IType, kElementsPerHalfGroup> x1_vec;
-  const IType *base = input + row * cols + col;
-  x0_vec.load_from(base);
-  x1_vec.load_from(base + kElementsPerHalfGroup);
-
-  float x0[kElementsPerHalfGroup];
-  float x1[kElementsPerHalfGroup];
-  float group_amax = 0.0f;
-#pragma unroll
-  for (int i = 0; i < kElementsPerHalfGroup; ++i) {
-    const float v0 = static_cast<float>(x0_vec.data.elt[i]);
-    const float v1 = static_cast<float>(x1_vec.data.elt[i]);
-    x0[i] = v0;
-    x1[i] = v1;
-    group_amax = fmaxf(group_amax, fabsf(v0));
-    group_amax = fmaxf(group_amax, fabsf(v1));
-  }
-
-  nvfp4_scale_t *scale_out = &scales[row * scale_stride + col_group];
-  fp4e2m1x2 *packed_out = &output[(row * cols + col) / 2];
-  if constexpr (USE_2D_QUANTIZATION) {
-    // amax and the map4/map6 error are reduced across the 16-row tile.
-    const float block_amax = reduce_group_max_16(group_amax);
+    const float global_amax = amax[tensor_id];
     const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, global_amax);
     CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
-    const float err_map4 = reduce_group_sum_16(candidates.map4.err);
-    const float err_map6 = reduce_group_sum_16(candidates.map6.err);
+
+    float err_map4 = candidates.map4.err;
+    float err_map6 = candidates.map6.err;
+    if constexpr (USE_2D_QUANTIZATION) {
+      err_map4 = reduce_group_sum_16(err_map4);
+      err_map6 = reduce_group_sum_16(err_map6);
+    }
+
     const bool pick_map4 = err_map4 < err_map6;
-    *scale_out = select_scale(scale_pair, pick_map4);
-    store_packed_group(select_packed(candidates, pick_map4), packed_out);
-  } else {
-    const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(group_amax, global_amax);
-    CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
-    const bool pick_map4 = candidates.map4.err < candidates.map6.err;
-    *scale_out = select_scale(scale_pair, pick_map4);
-    store_packed_group(select_packed(candidates, pick_map4), packed_out);
+    const size_t global_col_group = global_col / kGroupSize;
+    scales[global_row * scale_stride + global_col_group] = select_scale(scale_pair, pick_map4);
+    store_packed_group(select_packed(candidates, pick_map4),
+                       &output[(global_row * cols + global_col) / 2]);
   }
 }
 
 template <bool USE_2D_QUANTIZATION, typename Cfg, int E4M3_MAX, typename IType>
-__device__ __forceinline__ void quantize_group_colwise(
-    const IType *__restrict__ input, fp4e2m1x2 *__restrict__ output_t,
+__device__ void quantize_group_stage_colwise(
+    const IType *__restrict__ tile, fp4e2m1x2 *__restrict__ output_t,
     nvfp4_scale_t *__restrict__ scales_t, const float *__restrict__ amax,
-    const group_4over6::GroupedLayout &layout, const size_t group_idx) {
+    const group_4over6::GroupedLayout &layout, const size_t stage_row, const size_t tile_col) {
   const size_t rows = layout.rows;
   const size_t cols = layout.cols;
-  const size_t row_groups = rows / kGroupSize;
-
-  size_t col;
-  size_t row_start;
-  if constexpr (USE_2D_QUANTIZATION) {
-    // A 16-lane tile cooperates over one kGroupSize x kGroupSize block (one column per lane).
-    const size_t col_groups = cols / kGroupSize;
-    const size_t lane_in_tile = group_idx % kGroupSize;
-    const size_t tile_idx = group_idx / kGroupSize;
-    const size_t row_group = tile_idx / col_groups;
-    if (row_group >= row_groups) {
-      return;
+  constexpr int groups = kStageRowGroups * kTileCols;
+  for (int group = threadIdx.x; group < groups; group += blockDim.x) {
+    const int local_row_group = group / kTileCols;
+    const int local_col = group - local_row_group * kTileCols;
+    const int local_row = local_row_group * kGroupSize;
+    const size_t global_row = stage_row + local_row;
+    const size_t global_col = tile_col + local_col;
+    if (global_row >= rows || global_col >= cols) {
+      continue;
     }
-    row_start = row_group * kGroupSize;
-    col = (tile_idx % col_groups) * kGroupSize + lane_in_tile;
-  } else {
-    col = group_idx / row_groups;
-    const size_t row_group = group_idx - col * row_groups;
-    if (col >= cols) {
-      return;
+
+    const size_t tensor_id = layout.tensor_id(global_row);
+    const size_t tensor_row_start = layout.start_row(tensor_id);
+    const size_t tensor_rows = layout.tensor_rows(tensor_id);
+    const size_t tensor_local_row = global_row - tensor_row_start;
+    if (tensor_local_row + kGroupSize > tensor_rows) {
+      continue;
     }
-    row_start = row_group * kGroupSize;
-  }
 
-  const size_t tensor_id = layout.tensor_id(row_start);
-  const size_t tensor_row_start = layout.start_row(tensor_id);
-  const size_t tensor_rows = layout.tensor_rows(tensor_id);
-  const size_t local_row = row_start - tensor_row_start;
-  if (local_row + kGroupSize > tensor_rows) {
-    return;
-  }
-  const float global_amax = amax[tensor_id];
+    float x0[kElementsPerHalfGroup];
+    float x1[kElementsPerHalfGroup];
+    float group_amax = 0.0f;
+    load_col_group(tile, local_row, local_col, x0, x1, &group_amax);
 
-  float x0[kElementsPerHalfGroup];
-  float x1[kElementsPerHalfGroup];
-  float group_amax = 0.0f;
-#pragma unroll
-  for (int i = 0; i < kElementsPerHalfGroup; ++i) {
-    const float v0 = static_cast<float>(input[(row_start + i) * cols + col]);
-    const float v1 =
-        static_cast<float>(input[(row_start + kElementsPerHalfGroup + i) * cols + col]);
-    x0[i] = v0;
-    x1[i] = v1;
-    group_amax = fmaxf(group_amax, fabsf(v0));
-    group_amax = fmaxf(group_amax, fabsf(v1));
-  }
+    float block_amax = group_amax;
+    if constexpr (USE_2D_QUANTIZATION) {
+      // amax and the map4/map6 error are reduced across the 16-column tile.
+      block_amax = reduce_group_max_16(group_amax);
+    }
 
-  const size_t tensor_scale_offset = layout.columnwise_scale_offset(tensor_id);
-  const size_t tensor_scale_stride =
-      group_4over6::GroupedLayout::columnwise_scale_cols(tensor_rows);
-  const size_t tensor_packed_offset = (tensor_row_start * cols) / 2;
-  const size_t tensor_colwise_offset = tensor_packed_offset + (col * tensor_rows + local_row) / 2;
-  nvfp4_scale_t *scale_out =
-      &scales_t[tensor_scale_offset + col * tensor_scale_stride + local_row / kGroupSize];
-  fp4e2m1x2 *packed_out = &output_t[tensor_colwise_offset];
-  if constexpr (USE_2D_QUANTIZATION) {
-    // amax and the map4/map6 error are reduced across the 16-column tile.
-    const float block_amax = reduce_group_max_16(group_amax);
+    const float global_amax = amax[tensor_id];
     const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, global_amax);
     CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
-    const float err_map4 = reduce_group_sum_16(candidates.map4.err);
-    const float err_map6 = reduce_group_sum_16(candidates.map6.err);
+
+    float err_map4 = candidates.map4.err;
+    float err_map6 = candidates.map6.err;
+    if constexpr (USE_2D_QUANTIZATION) {
+      err_map4 = reduce_group_sum_16(err_map4);
+      err_map6 = reduce_group_sum_16(err_map6);
+    }
+
     const bool pick_map4 = err_map4 < err_map6;
-    *scale_out = select_scale(scale_pair, pick_map4);
-    store_packed_group(select_packed(candidates, pick_map4), packed_out);
-  } else {
-    const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(group_amax, global_amax);
-    CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, global_amax);
-    const bool pick_map4 = candidates.map4.err < candidates.map6.err;
-    *scale_out = select_scale(scale_pair, pick_map4);
-    store_packed_group(select_packed(candidates, pick_map4), packed_out);
+    const size_t tensor_scale_offset = layout.columnwise_scale_offset(tensor_id);
+    const size_t tensor_scale_stride =
+        group_4over6::GroupedLayout::columnwise_scale_cols(tensor_rows);
+    const size_t tensor_packed_offset = (tensor_row_start * cols) / 2;
+    const size_t tensor_colwise_offset =
+        tensor_packed_offset + (global_col * tensor_rows + tensor_local_row) / 2;
+    scales_t[tensor_scale_offset + global_col * tensor_scale_stride +
+             tensor_local_row / kGroupSize] = select_scale(scale_pair, pick_map4);
+    store_packed_group(select_packed(candidates, pick_map4), &output_t[tensor_colwise_offset]);
   }
 }
 
@@ -291,20 +250,53 @@ __global__ void __launch_bounds__(kThreads)
     return;
   }
 
-  const group_4over6::GroupedLayout layout{rows, cols, num_tensors, has_first_dims, offsets};
-  const size_t group_idx = blockIdx.x * blockDim.x + threadIdx.x;
-  if constexpr (RETURN_ROWWISE) {
-    quantize_group_rowwise<USE_2D_QUANTIZATION, Cfg, E4M3_MAX>(
-        input, output, scales, amax_rowwise, layout, scale_stride, group_idx);
+  extern __shared__ char dynamic_shmem[];
+  auto *tiles = reinterpret_cast<IType *>(dynamic_shmem);
+  const size_t tile_col = blockIdx.x * kTileCols;
+  const size_t tile_row = blockIdx.y * kTileRows;
+
+  IType *stage_tiles[kPipelineStages];
+#pragma unroll
+  for (int stage = 0; stage < kPipelineStages; ++stage) {
+    stage_tiles[stage] = &tiles[stage * kStageRows * kTileCols];
   }
 
-  if constexpr (RETURN_COLUMNWISE) {
-    const float *columnwise_amax = amax_colwise;
-    if (columnwise_amax == nullptr) {
-      columnwise_amax = amax_rowwise;
+  load_stage_to_shared_async(input, stage_tiles[0], rows, cols, tile_row, tile_col);
+  cp_async_commit_group();
+  cp_async_wait_group<0>();
+  __syncthreads();
+
+  const group_4over6::GroupedLayout layout{rows, cols, num_tensors, has_first_dims, offsets};
+
+  for (int stage = 0; stage < kPipelineStages; ++stage) {
+    const int next_stage = stage + 1;
+    if (next_stage < kPipelineStages) {
+      const size_t next_stage_row = tile_row + next_stage * kStageRows;
+      load_stage_to_shared_async(input, stage_tiles[next_stage], rows, cols, next_stage_row,
+                                 tile_col);
+      cp_async_commit_group();
     }
-    quantize_group_colwise<USE_2D_QUANTIZATION, Cfg, E4M3_MAX>(
-        input, output_t, scales_t, columnwise_amax, layout, group_idx);
+
+    const size_t stage_row = tile_row + stage * kStageRows;
+    IType *stage_tile = stage_tiles[stage];
+    if constexpr (RETURN_ROWWISE) {
+      quantize_group_stage_rowwise<USE_2D_QUANTIZATION, Cfg, E4M3_MAX>(
+          stage_tile, output, scales, amax_rowwise, layout, stage_row, tile_col, scale_stride);
+    }
+
+    if constexpr (RETURN_COLUMNWISE) {
+      const float *columnwise_amax = amax_colwise;
+      if (columnwise_amax == nullptr) {
+        columnwise_amax = amax_rowwise;
+      }
+      quantize_group_stage_colwise<USE_2D_QUANTIZATION, Cfg, E4M3_MAX>(
+          stage_tile, output_t, scales_t, columnwise_amax, layout, stage_row, tile_col);
+    }
+
+    if (next_stage < kPipelineStages) {
+      cp_async_wait_group<0>();
+      __syncthreads();
+    }
   }
 #else
   NVTE_DEVICE_ERROR("sm_100 or higher is required.");
@@ -321,11 +313,10 @@ void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
     return;
   }
 
-  const size_t rowwise_groups = RETURN_ROWWISE ? rows * (cols / kGroupSize) : 0;
-  const size_t columnwise_groups = RETURN_COLUMNWISE ? cols * (rows / kGroupSize) : 0;
-  const size_t groups = rowwise_groups > columnwise_groups ? rowwise_groups : columnwise_groups;
-  const dim3 grid(static_cast<unsigned int>(DIVUP(groups, static_cast<size_t>(kThreads))));
+  const dim3 grid(DIVUP(cols, static_cast<size_t>(kTileCols)),
+                  DIVUP(rows, static_cast<size_t>(kTileRows)));
   const dim3 block(kThreads);
+  const size_t shmem = kPipelineStages * kStageRows * kTileCols * sizeof(IType);
   const auto *input_ptr = reinterpret_cast<const IType *>(input->data.dptr);
   auto *output_ptr = reinterpret_cast<fp4e2m1x2 *>(output->data.dptr);
   auto *output_t_ptr = reinterpret_cast<fp4e2m1x2 *>(output->columnwise_data.dptr);
@@ -338,12 +329,13 @@ void launch_group_quantize_4over6(const GroupedTensor *input, GroupedTensor *out
   const size_t scale_stride =
       RETURN_ROWWISE ? DIVUP_TO_MULTIPLE(cols / kGroupSize, static_cast<size_t>(4)) : 0;
 
-  group_quantize_4over6_kernel<USE_2D_QUANTIZATION, RETURN_ROWWISE, RETURN_COLUMNWISE, Cfg,
-                               E4M3_MAX, IType>
-      <<<grid, block, 0, stream>>>(input_ptr, output_ptr, output_t_ptr, scales_ptr, scales_t_ptr,
-                                   amax_rowwise_ptr, amax_colwise_ptr, offsets_ptr, rows, cols,
-                                   output->num_tensors, scale_stride,
-                                   output->first_dims.dptr != nullptr, noop_ptr);
+  auto kernel = group_quantize_4over6_kernel<USE_2D_QUANTIZATION, RETURN_ROWWISE, RETURN_COLUMNWISE,
+                                             Cfg, E4M3_MAX, IType>;
+  cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shmem);
+  kernel<<<grid, block, shmem, stream>>>(input_ptr, output_ptr, output_t_ptr, scales_ptr,
+                                         scales_t_ptr, amax_rowwise_ptr, amax_colwise_ptr,
+                                         offsets_ptr, rows, cols, output->num_tensors, scale_stride,
+                                         output->first_dims.dptr != nullptr, noop_ptr);
 }
 
 constexpr int kFusedBlockWarps = 8;
