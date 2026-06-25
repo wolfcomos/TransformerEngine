@@ -69,40 +69,6 @@ struct GroupedLayout {
     }
     return (static_cast<size_t>(offsets[id + 1]) - static_cast<size_t>(offsets[id])) / cols;
   }
-
-  static __device__ __forceinline__ size_t columnwise_scale_cols(const size_t tensor_rows) {
-    return (((tensor_rows / kGroupSize) + 3) / 4) * 4;
-  }
-
-  static __device__ __forceinline__ size_t rowwise_scale_rows(const size_t tensor_rows) {
-    return ((tensor_rows + 127) / 128) * 128;
-  }
-
-  __device__ __forceinline__ size_t rowwise_scale_offset(const size_t id,
-                                                         const size_t scale_stride) const {
-    if (!has_first_dims) {
-      return id * rowwise_scale_rows(rows / num_tensors) * scale_stride;
-    }
-    size_t offset = 0;
-    for (size_t i = 0; i < id; ++i) {
-      offset += rowwise_scale_rows(tensor_rows(i)) * scale_stride;
-    }
-    return offset;
-  }
-
-  __device__ __forceinline__ size_t columnwise_scale_offset(const size_t id) const {
-    const size_t scale_rows = ((cols + 127) / 128) * 128;
-    if (!has_first_dims) {
-      return id * scale_rows * columnwise_scale_cols(rows / num_tensors);
-    }
-    size_t offset = 0;
-    for (size_t i = 0; i < id; ++i) {
-      const size_t t_rows =
-          (static_cast<size_t>(offsets[i + 1]) - static_cast<size_t>(offsets[i])) / cols;
-      offset += scale_rows * columnwise_scale_cols(t_rows);
-    }
-    return offset;
-  }
 };
 
 }  // namespace group_4over6
@@ -249,9 +215,21 @@ __device__ __forceinline__ void quantize_group_colwise(
     group_amax = fmaxf(group_amax, fabsf(v1));
   }
 
-  const size_t tensor_scale_offset = layout.columnwise_scale_offset(tensor_id);
+  const size_t scale_rows = DIVUP_TO_MULTIPLE(cols, static_cast<size_t>(128));
+  size_t tensor_scale_offset = 0;
+  if (!layout.has_first_dims) {
+    const size_t scale_cols =
+        DIVUP_TO_MULTIPLE((rows / layout.num_tensors) / kGroupSize, static_cast<size_t>(4));
+    tensor_scale_offset = tensor_id * scale_rows * scale_cols;
+  } else {
+    for (size_t i = 0; i < tensor_id; ++i) {
+      const size_t scale_cols =
+          DIVUP_TO_MULTIPLE(layout.tensor_rows(i) / kGroupSize, static_cast<size_t>(4));
+      tensor_scale_offset += scale_rows * scale_cols;
+    }
+  }
   const size_t tensor_scale_stride =
-      group_4over6::GroupedLayout::columnwise_scale_cols(tensor_rows);
+      DIVUP_TO_MULTIPLE(tensor_rows / kGroupSize, static_cast<size_t>(4));
   const size_t tensor_packed_offset = (tensor_row_start * cols) / 2;
   const size_t tensor_colwise_offset = tensor_packed_offset + (col * tensor_rows + local_row) / 2;
   nvfp4_scale_t *scale_out =
@@ -381,7 +359,16 @@ __global__ void __launch_bounds__(kFusedThreads)
   if (active) {
     const size_t tensor_id = layout.tensor_id(row);
     local_row = row - layout.start_row(tensor_id);
-    scale_offset = layout.rowwise_scale_offset(tensor_id, scale_stride);
+    if (!has_first_dims) {
+      scale_offset =
+          tensor_id * DIVUP_TO_MULTIPLE(rows / num_tensors, static_cast<size_t>(128)) *
+          scale_stride;
+    } else {
+      for (size_t i = 0; i < tensor_id; ++i) {
+        scale_offset += DIVUP_TO_MULTIPLE(layout.tensor_rows(i), static_cast<size_t>(128)) *
+                        scale_stride;
+      }
+    }
   }
 
   constexpr int kVecElems = 16 / sizeof(IType);
