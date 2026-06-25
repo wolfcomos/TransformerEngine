@@ -478,11 +478,6 @@ void group_quantize_fwd_helper(const NVTEGroupedTensor input, NVTEGroupedTensor 
                  "Grouped NVFP4 4over6 quantization requires compact scale layout.");
 
       if (quant_config_cpp.nvfp4_row_scaled) {
-        NVTE_CHECK(output_tensor->has_data(),
-                   "Row-scaled grouped NVFP4 4over6 quantization requires rowwise output data.");
-        NVTE_CHECK(!output_tensor->has_columnwise_data(),
-                   "Row-scaled grouped NVFP4 4over6 quantization does not support columnwise "
-                   "output.");
         nvfp4::group_quantize_row_scaled_4over6(input_tensor, output_tensor, &quant_config_cpp,
                                                 stream);
       } else {
