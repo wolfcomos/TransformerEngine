@@ -30,10 +30,7 @@ namespace group_4over6 {
 
 constexpr size_t kGroupSize = 16;
 
-// Resolves per-tensor geometry for a grouped tensor stored as a single logical
-// [rows, cols] buffer. With `has_first_dims == false` every tensor owns the same
-// number of rows; otherwise `offsets` holds element-offset prefix sums (length
-// num_tensors + 1) that delimit each tensor.
+
 struct GroupedLayout {
   size_t rows;
   size_t cols;
