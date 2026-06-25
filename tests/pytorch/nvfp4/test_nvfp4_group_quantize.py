@@ -31,9 +31,6 @@ from nvfp4_utils import (
     swizzle_nvfp4_scale,
 )
 
-# Reuse the 4over6 exact-test config matrix and err-fast-math env toggle so
-# grouped quantization is checked against the same recipe combinations as the
-# flat NVFP4 exact tests.
 from test_nvfp4_quantize_exact import (
     NVFP4_4OVER6_CONFIGS,
     nvfp4_4over6_err_fast_math,
@@ -41,128 +38,84 @@ from test_nvfp4_quantize_exact import (
 
 recipe_available, reason_for_no_recipe = te.is_nvfp4_available(return_reason=True)
 
+GROUPED_4OVER6_SHAPES = [
+    ("aligned_no_padding", 256, 512, [128, 128], ("row_scaled_1d",)),
+    ("hidden_padding", 384, 320, [128, 128, 128], ("row_scaled_1d",)),
+    ("uneven_splits", 304, 512, [96, 208], ("row_scaled_1d",)),
+    ("scale_col_padding", 640, 2064, [208, 432], ("row_scaled_1d",)),
+    ("large", 1024, 7168, [512, 512], ("row_scaled_1d",)),
+    ("regular", 384, 512, [128, 256], ("tensor_scaled_1d", "tensor_scaled_2d")),
+    (
+        "uneven_128_aligned",
+        768,
+        384,
+        [128, 256, 384],
+        ("tensor_scaled_1d", "tensor_scaled_2d"),
+    ),
+    ("single_tensor", 128, 512, [128], ("tensor_scaled_1d",)),
+]
+GROUPED_4OVER6_SHAPE_IDS = [case[0] for case in GROUPED_4OVER6_SHAPES]
+
+GROUPED_4OVER6_MODES = [
+    ("tensor_scaled", "1d", "rowwise_only", False, False),
+    ("tensor_scaled", "1d", "rowwise_only", True, False),
+    ("tensor_scaled", "1d", "columnwise_only", False, False),
+    ("tensor_scaled", "1d", "both_directions", False, False),
+    ("tensor_scaled", "1d", "both_directions", True, False),
+    ("tensor_scaled", "1d", "both_directions", False, True),
+    ("tensor_scaled", "2d", "rowwise_only", False, False),
+    ("tensor_scaled", "2d", "rowwise_only", True, False),
+    ("tensor_scaled", "2d", "both_directions", False, False),
+    ("tensor_scaled", "2d", "both_directions", True, False),
+    ("row_scaled", "1d", "rowwise_only", True, False),
+]
+GROUPED_4OVER6_MODE_IDS = [
+    f"{scaling}_{quant_dim}-{'compute_amax' if compute_amax else 'with_amax'}"
+    f"-{quantize_mode}{'-precomputed_offsets' if precomputed_offsets else ''}"
+    for scaling, quant_dim, quantize_mode, compute_amax, precomputed_offsets in GROUPED_4OVER6_MODES
+]
+
 
 @pytest.mark.skipif(not recipe_available, reason=reason_for_no_recipe)
 @pytest.mark.parametrize(
-    "case",
-    [
-        pytest.param(
-            {
-                "kind": "recipe_state",
-                "rows": 256,
-                "hidden": 512,
-                "splits": [128, 128],
-                "compute_amax": True,
-                "quantize_mode": "both_directions",
-                "with_2d_quantization": False,
-                "precomputed_offsets": False,
-                "err_use_fast_math": err_use_fast_math,
-            },
-            id=f"recipe_state-{'fast_err' if err_use_fast_math else 'exact_err'}",
-        )
-        for err_use_fast_math in (False, True)
-    ]
-    + [
-        pytest.param(
-            {
-                "kind": "row_scaled_1d",
-                "cfg": cfg,
-                "rows": rows,
-                "hidden": hidden,
-                "splits": splits,
-                "compute_amax": True,
-                "quantize_mode": "rowwise_only",
-                "with_2d_quantization": False,
-                "precomputed_offsets": False,
-            },
-            id=f"row_scaled_1d-{shape_id}-{cfg.id}",
-        )
-        for cfg in NVFP4_4OVER6_CONFIGS
-        if cfg.use_4over6
-        for rows, hidden, splits, shape_id in [
-            (256, 512, [128, 128], "aligned_no_padding"),
-            (384, 320, [128, 128, 128], "hidden_padding"),
-            (304, 512, [96, 208], "uneven_splits"),
-            (640, 2064, [208, 432], "scale_col_padding"),
-            (1024, 7168, [512, 512], "large"),
-        ]
-    ]
-    + [
-        pytest.param(
-            {
-                "kind": "tensor_scaled_1d",
-                "cfg": cfg,
-                "rows": rows,
-                "hidden": hidden,
-                "splits": splits,
-                "compute_amax": compute_amax,
-                "quantize_mode": quantize_mode,
-                "with_2d_quantization": False,
-                "precomputed_offsets": precomputed_offsets,
-            },
-            id=f"tensor_scaled_1d-{path_id}-{quantize_mode}-{shape_id}-{cfg.id}",
-        )
-        for cfg in NVFP4_4OVER6_CONFIGS
-        if cfg.use_4over6
-        for compute_amax, quantize_mode, precomputed_offsets, path_id in [
-            (False, "rowwise_only", False, "with_amax"),
-            (True, "rowwise_only", False, "compute_amax"),
-            (False, "columnwise_only", False, "with_amax"),
-            (False, "both_directions", False, "with_amax"),
-            (True, "both_directions", False, "compute_amax"),
-            (False, "both_directions", True, "precomputed_offsets"),
-        ]
-        for rows, hidden, splits, shape_id in [
-            (384, 512, [128, 256], "regular"),
-            (768, 384, [128, 256, 384], "uneven_128_aligned"),
-            (128, 512, [128], "single_tensor"),
-        ]
-    ]
-    + [
-        pytest.param(
-            {
-                "kind": "tensor_scaled_2d",
-                "cfg": cfg,
-                "rows": rows,
-                "hidden": hidden,
-                "splits": splits,
-                "compute_amax": compute_amax,
-                "quantize_mode": quantize_mode,
-                "with_2d_quantization": True,
-                "precomputed_offsets": False,
-            },
-            id=f"tensor_scaled_2d-{path_id}-{quantize_mode}-{shape_id}-{cfg.id}",
-        )
-        for cfg in NVFP4_4OVER6_CONFIGS
-        if cfg.use_4over6
-        for compute_amax, quantize_mode, path_id in [
-            (False, "rowwise_only", "with_amax"),
-            (True, "rowwise_only", "compute_amax"),
-            (False, "both_directions", "with_amax"),
-            (True, "both_directions", "compute_amax"),
-        ]
-        for rows, hidden, splits, shape_id in [
-            (384, 512, [128, 256], "regular"),
-            (768, 384, [128, 256, 384], "uneven_128_aligned"),
-        ]
-    ],
+    "shape_id, rows, hidden, splits, supported_cases",
+    GROUPED_4OVER6_SHAPES,
+    ids=GROUPED_4OVER6_SHAPE_IDS,
 )
-def test_grouped_nvfp4_4over6_quantize_matches_split_nvfp4_4over6(case: dict) -> None:
+@pytest.mark.parametrize(
+    "scaling, quant_dim, quantize_mode, compute_amax, precomputed_offsets",
+    GROUPED_4OVER6_MODES,
+    ids=GROUPED_4OVER6_MODE_IDS,
+)
+@pytest.mark.parametrize(
+    "cfg",
+    [cfg for cfg in NVFP4_4OVER6_CONFIGS if cfg.use_4over6],
+    ids=lambda cfg: cfg.id,
+)
+def test_grouped_nvfp4_4over6_quantize_matches_split_nvfp4_4over6(
+    cfg,
+    scaling: str,
+    quant_dim: str,
+    quantize_mode: str,
+    compute_amax: bool,
+    precomputed_offsets: bool,
+    shape_id: str,
+    rows: int,
+    hidden: int,
+    splits: list[int],
+    supported_cases: tuple[str, ...],
+) -> None:
     """Grouped NVFP4 4over6 quantization should bitwise match per-split NVFP4 4over6."""
 
     device = "cuda"
     torch.manual_seed(1234)
     torch.cuda.manual_seed(1234)
 
-    kind = case["kind"]
-    cfg = case.get("cfg")
-    rows = case["rows"]
-    hidden = case["hidden"]
-    splits = case["splits"]
-    compute_amax = case["compute_amax"]
-    quantize_mode = case["quantize_mode"]
-    with_2d_quantization = case["with_2d_quantization"]
-    precomputed_offsets = case["precomputed_offsets"]
+    kind = f"{scaling}_{quant_dim}"
+    if kind not in supported_cases:
+        pytest.skip(f"{shape_id} is not used for {kind}")
+
+    with_2d_quantization = quant_dim == "2d"
     return_rowwise = quantize_mode != "columnwise_only"
     return_columnwise = quantize_mode != "rowwise_only"
 
@@ -183,7 +136,106 @@ def test_grouped_nvfp4_4over6_quantize_matches_split_nvfp4_4over6(case: dict) ->
     x = torch.randn((rows, hidden), dtype=torch.bfloat16, device=device)
     x_chunks = torch.split(x, splits)
 
-    if kind == "recipe_state":
+    quantizer = NVFP4Quantizer(
+        fp4_dtype=te.DType.kFloat4E2M1,
+        rowwise=return_rowwise,
+        columnwise=return_columnwise,
+        with_amax_reduction=False,
+        amax_reduction_group=None,
+        with_rht=False,
+        with_post_rht_amax=False,
+        with_2d_quantization=with_2d_quantization,
+        stochastic_rounding=False,
+        row_scaled_nvfp4=scaling == "row_scaled",
+        nvfp4_use_4over6=True,
+        nvfp4_e4m3_max=cfg.e4m3_max,
+        nvfp4_4over6_err_mode=cfg.err_mode,
+    )
+    err_use_fast_math = cfg.err_use_fast_math
+
+    if scaling == "row_scaled":
+        expected_amax = torch.cat([chunk.abs().amax(dim=1).float() for chunk in x_chunks])
+    else:
+        expected_amax = torch.stack([chunk.abs().amax().float() for chunk in x_chunks])
+
+    def _check_quantizer(test_quantizer, test_err_use_fast_math: bool) -> None:
+        with nvfp4_4over6_err_fast_math(test_err_use_fast_math):
+            if compute_amax:
+                grouped = tex.group_quantize(x, test_quantizer, len(splits), first_dims)
+            else:
+                grouped = tex.nvfp4_group_quantize_with_amax(
+                    x,
+                    test_quantizer,
+                    len(splits),
+                    first_dims,
+                    expected_amax,
+                    expected_amax,
+                    tensor_offsets=tensor_offsets,
+                )
+            refs = [test_quantizer(chunk) for chunk in x_chunks]
+
+        if tensor_offsets is not None:
+            assert grouped.tensor_offsets.data_ptr() == tensor_offsets.data_ptr()
+
+        def _assert_valid_scale_close(actual, expected, split: int, columnwise: bool) -> None:
+            valid_scale_shape = get_nvfp4_scale_shape_no_padding((split, hidden), columnwise)
+            torch.testing.assert_close(
+                actual.view(torch.uint8)[: valid_scale_shape[0], : valid_scale_shape[1]],
+                expected.view(torch.uint8)[: valid_scale_shape[0], : valid_scale_shape[1]],
+                atol=0,
+                rtol=0,
+            )
+
+        for split, split_tensor, ref in zip(splits, grouped.split_into_quantized_tensors(), refs):
+            if return_rowwise:
+                torch.testing.assert_close(
+                    split_tensor._rowwise_data.view(dtype=torch.uint8).reshape(-1),
+                    ref._rowwise_data.view(dtype=torch.uint8).reshape(-1),
+                    atol=0,
+                    rtol=0,
+                )
+                _assert_valid_scale_close(
+                    split_tensor._rowwise_scale_inv, ref._rowwise_scale_inv, split, False
+                )
+                torch.testing.assert_close(
+                    split_tensor._amax_rowwise,
+                    ref._amax_rowwise,
+                    atol=0,
+                    rtol=0,
+                )
+
+            if return_columnwise:
+                torch.testing.assert_close(
+                    split_tensor._columnwise_data.view(dtype=torch.uint8).reshape(-1),
+                    ref._columnwise_data.view(dtype=torch.uint8).reshape(-1),
+                    atol=0,
+                    rtol=0,
+                )
+                _assert_valid_scale_close(
+                    split_tensor._columnwise_scale_inv,
+                    ref._columnwise_scale_inv,
+                    split,
+                    True,
+                )
+                torch.testing.assert_close(
+                    split_tensor._amax_columnwise,
+                    ref._amax_columnwise,
+                    atol=0,
+                    rtol=0,
+                )
+
+    _check_quantizer(quantizer, err_use_fast_math)
+
+    if (
+        scaling == "tensor_scaled"
+        and quant_dim == "1d"
+        and quantize_mode == "both_directions"
+        and compute_amax
+        and not precomputed_offsets
+        and shape_id == "regular"
+        and cfg.e4m3_max == 256
+        and cfg.err_mode == "MSE"
+    ):
         recipe = NVFP4BlockScaling(
             disable_rht=True,
             disable_stochastic_rounding=True,
@@ -192,159 +244,19 @@ def test_grouped_nvfp4_4over6_quantize_matches_split_nvfp4_4over6(case: dict) ->
             nvfp4_4over6_e4m3_use_256="all",
             nvfp4_4over6_err_mode="MSE",
         )
-        quantizer = NVFP4BlockScalingRecipeState(
+        recipe_quantizer = NVFP4BlockScalingRecipeState(
             recipe,
             mode="forward",
             num_quantizers=1,
             roles=[QuantizerRole(module_type="grouped_linear", tensor_type="input")],
         ).make_quantizers()[0]
-        assert quantizer.nvfp4_use_4over6
-        assert quantizer.nvfp4_e4m3_max == 256
-        assert quantizer.nvfp4_4over6_err_mode == "MSE"
-        assert not quantizer.with_rht
-        assert not quantizer.stochastic_rounding
-        assert not quantizer.with_2d_quantization
-        err_use_fast_math = case["err_use_fast_math"]
-    else:
-        quantizer = NVFP4Quantizer(
-            fp4_dtype=te.DType.kFloat4E2M1,
-            rowwise=return_rowwise,
-            columnwise=return_columnwise,
-            with_amax_reduction=False,
-            amax_reduction_group=None,
-            with_rht=False,
-            with_post_rht_amax=False,
-            with_2d_quantization=with_2d_quantization,
-            stochastic_rounding=False,
-            row_scaled_nvfp4=kind == "row_scaled_1d",
-            nvfp4_use_4over6=True,
-            nvfp4_e4m3_max=cfg.e4m3_max,
-            nvfp4_4over6_err_mode=cfg.err_mode,
-        )
-        err_use_fast_math = cfg.err_use_fast_math
-
-    if kind == "row_scaled_1d":
-        expected_amax = torch.cat([chunk.abs().amax(dim=1).float() for chunk in x_chunks])
-    else:
-        expected_amax = torch.stack([chunk.abs().amax().float() for chunk in x_chunks])
-
-    with nvfp4_4over6_err_fast_math(err_use_fast_math):
-        if compute_amax:
-            grouped = tex.group_quantize(x, quantizer, len(splits), first_dims)
-        else:
-            grouped = tex.nvfp4_group_quantize_with_amax(
-                x,
-                quantizer,
-                len(splits),
-                first_dims,
-                expected_amax,
-                expected_amax,
-                tensor_offsets=tensor_offsets,
-            )
-        refs = [quantizer(chunk) for chunk in x_chunks]
-
-    if tensor_offsets is not None:
-        assert grouped.tensor_offsets.data_ptr() == tensor_offsets.data_ptr()
-
-    if return_rowwise:
-        packed_offset = 0
-        scale_cols = (((hidden // 16) + 3) // 4) * 4
-        scale_offset = 0
-        for split, ref in zip(splits, refs):
-            packed_elems = split * hidden // 2
-            torch.testing.assert_close(
-                grouped.rowwise_data[packed_offset : packed_offset + packed_elems],
-                ref._rowwise_data.view(dtype=torch.uint8).reshape(-1),
-                atol=0,
-                rtol=0,
-            )
-            split_scale_rows = ((split + 127) // 128) * 128
-            scale_elems = split_scale_rows * scale_cols
-            grouped_scales = grouped.scale_inv[
-                scale_offset : scale_offset + scale_elems
-            ].view(torch.uint8).reshape(split_scale_rows, scale_cols)
-            valid_ref_scales = ref._rowwise_scale_inv.view(torch.uint8).reshape(
-                split_scale_rows, scale_cols
-            )[:split, : hidden // 16]
-            torch.testing.assert_close(
-                grouped_scales[:split, : hidden // 16].reshape(-1),
-                valid_ref_scales.reshape(-1),
-                atol=0,
-                rtol=0,
-            )
-            packed_offset += packed_elems
-            scale_offset += scale_elems
-
-        torch.testing.assert_close(grouped.amax, expected_amax, atol=0, rtol=0)
-
-        grouped_dequantized = torch.cat(
-            [
-                tex.dequantize(t, te.DType.kBFloat16)
-                for t in grouped.split_into_quantized_tensors()
-            ],
-            dim=0,
-        )
-        ref_dequantized = torch.cat(
-            [tex.dequantize(ref, te.DType.kBFloat16) for ref in refs],
-            dim=0,
-        )
-        torch.testing.assert_close(
-            grouped_dequantized,
-            ref_dequantized,
-            atol=0,
-            rtol=0,
-        )
-
-    if return_columnwise:
-        packed_offset = 0
-        scale_offset = 0
-        for split, ref in zip(splits, refs):
-            packed_elems = split * hidden // 2
-            torch.testing.assert_close(
-                grouped.columnwise_data[packed_offset : packed_offset + packed_elems],
-                ref._columnwise_data.view(dtype=torch.uint8).reshape(-1),
-                atol=0,
-                rtol=0,
-            )
-            scale_rows = ((hidden + 127) // 128) * 128
-            scale_cols = (((split // 16) + 3) // 4) * 4
-            scale_elems = scale_rows * scale_cols
-            grouped_scales = grouped.columnwise_scale_inv[
-                scale_offset : scale_offset + scale_elems
-            ].view(torch.uint8).reshape(scale_rows, scale_cols)
-            valid_ref_scales = ref._columnwise_scale_inv.view(torch.uint8).reshape(
-                scale_rows, scale_cols
-            )[:hidden, : split // 16]
-            torch.testing.assert_close(
-                grouped_scales[:hidden, : split // 16].reshape(-1),
-                valid_ref_scales.reshape(-1),
-                atol=0,
-                rtol=0,
-            )
-            packed_offset += packed_elems
-            scale_offset += scale_elems
-
-        torch.testing.assert_close(grouped.columnwise_amax, expected_amax, atol=0, rtol=0)
-        split_tensors = grouped.split_into_quantized_tensors()
-        for split_tensor, ref in zip(split_tensors, refs):
-            torch.testing.assert_close(
-                split_tensor._columnwise_data.view(dtype=torch.uint8).reshape(-1),
-                ref._columnwise_data.view(dtype=torch.uint8).reshape(-1),
-                atol=0,
-                rtol=0,
-            )
-            torch.testing.assert_close(
-                split_tensor._columnwise_scale_inv.view(torch.uint8),
-                ref._columnwise_scale_inv.view(torch.uint8),
-                atol=0,
-                rtol=0,
-            )
-            torch.testing.assert_close(
-                split_tensor._amax_columnwise,
-                ref._amax_columnwise,
-                atol=0,
-                rtol=0,
-            )
+        assert recipe_quantizer.nvfp4_use_4over6
+        assert recipe_quantizer.nvfp4_e4m3_max == 256
+        assert recipe_quantizer.nvfp4_4over6_err_mode == "MSE"
+        assert not recipe_quantizer.with_rht
+        assert not recipe_quantizer.stochastic_rounding
+        assert not recipe_quantizer.with_2d_quantization
+        _check_quantizer(recipe_quantizer, cfg.err_use_fast_math)
 
 
 def check_group_quantization_nvfp4_versus_reference(

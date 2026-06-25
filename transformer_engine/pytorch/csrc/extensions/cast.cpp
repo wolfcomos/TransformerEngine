@@ -198,9 +198,6 @@ void group_quantize_nvfp4_impl(const GroupedTensorWrapper &grouped_input_tensor,
 
     NVTE_SCOPED_GIL_RELEASE({
       // TODO: Support non-128-aligned splits in the graph-safe grouped amax path.
-      // The current graph-safe grouped amax computes one amax per 128-row tile, so callers
-      // needing non-128-aligned splits should precompute amax and use
-      // nvfp4_group_quantize_with_amax.
       if (compute_amax) {
         nvte_group_amax_graph_safe(grouped_input_tensor.data(), grouped_output_tensor.data(),
                                    stream);
