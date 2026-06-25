@@ -13,11 +13,15 @@
 import transformer_engine.pytorch as te
 import transformer_engine_torch as tex
 from transformer_engine.pytorch import NVFP4Quantizer
+from transformer_engine.pytorch.custom_recipes.quantization_ref_nvfp4 import NVFP4QuantizerRef
+from transformer_engine.pytorch.custom_recipes import utils
 from transformer_engine.pytorch.quantization import NVFP4BlockScalingRecipeState, QuantizerRole
 from transformer_engine.common.recipe import NVFP4BlockScaling
 
 import pytest
 import torch
+import random
+import math
 
 from nvfp4_utils import (
     get_nvfp4_scale_shape_no_padding,
