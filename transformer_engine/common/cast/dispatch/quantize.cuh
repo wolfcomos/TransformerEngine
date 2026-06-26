@@ -111,7 +111,9 @@ void quantize_fwd_helper(const NVTETensor input, NVTETensor output,
                    "Row-scaled NVFP4 quantization does not support 2D quantization.");
         NVTE_CHECK(!output_tensor->has_columnwise_data(),
                    "Row-scaled NVFP4 quantization does not produce columnwise output.");
-        nvfp4::compute_rowwise_amax(*input_tensor, noop_tensor, output_tensor, stream);
+        if (!(nvfp4_use_4over6 && nvfp4::use_fused_rowwise_amax_4over6())) {
+          nvfp4::compute_rowwise_amax(*input_tensor, noop_tensor, output_tensor, stream);
+        }
       }
       bool use_optimized_kernel = (dtype == DType::kBFloat16) && (rows % 32 == 0) &&
                                   (cols % 32 == 0) && output_tensor->has_data();

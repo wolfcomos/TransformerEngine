@@ -26,6 +26,7 @@
 #include <cuda_runtime.h>
 #include <transformer_engine/transformer_engine.h>
 
+#include <cstdlib>
 #include <cstdint>
 
 #include "../../common.h"
@@ -36,6 +37,14 @@
 namespace transformer_engine {
 namespace dispatch {
 namespace nvfp4 {
+
+// Internal A/B switch: for tensors already using row-scaled 4over6, choose
+// whether rowwise amax is fused into quantization or computed by the legacy
+// prepass kernel.
+inline bool use_fused_rowwise_amax_4over6() {
+  const char *env = std::getenv("NVTE_NVFP4_4OVER6_FUSED_ROWWISE_AMAX");
+  return env == nullptr || std::atoi(env) != 0;
+}
 
 #if FP4_TYPE_SUPPORTED
 
@@ -614,6 +623,128 @@ __global__ void __launch_bounds__(kThreads)
 #endif
 }
 
+constexpr int kRowScaledFusedBlockWarps = 8;
+constexpr int kRowScaledFusedThreads = kRowScaledFusedBlockWarps * kWarpThreads;
+constexpr int kRowScaledFusedWarpsPerRow = 1;
+
+// Row-scaled 4over6 needs a full-row amax before quantizing any 16-value group.
+// The regular 4over6 kernel is column-tiled, so this fused path uses row-owner
+// warps instead of adding partial amax work to the tiled kernel.
+template <int WARPS_PER_ROW, typename Cfg, int E4M3_MAX, typename IType>
+__global__ void __launch_bounds__(kRowScaledFusedThreads)
+    quantize_row_scaled_4over6_kernel(const IType *__restrict__ input,
+                                      fp4e2m1x2 *__restrict__ output,
+                                      nvfp4_scale_t *__restrict__ scales,
+                                      float *__restrict__ amax_out, const size_t rows,
+                                      const size_t cols, const size_t scale_stride,
+                                      const float *__restrict__ noop) {
+#if (defined __CUDA_ARCH__) && (__CUDA_ARCH__ >= 1000)
+  if (noop != nullptr && noop[0] == 1.0f) {
+    return;
+  }
+  constexpr int kRowsPerBlock = kRowScaledFusedBlockWarps / WARPS_PER_ROW;
+  constexpr int kRowThreads = WARPS_PER_ROW * kWarpThreads;
+
+  const int lane = threadIdx.x % kWarpThreads;
+  const int warp_id = threadIdx.x / kWarpThreads;
+  const int warp_in_row = warp_id % WARPS_PER_ROW;
+  const int row_in_block = warp_id / WARPS_PER_ROW;
+  const int row_thread = warp_in_row * kWarpThreads + lane;
+  const size_t row = static_cast<size_t>(blockIdx.x) * kRowsPerBlock + row_in_block;
+  const bool active = row < rows;
+  const IType *row_in = input + (active ? row : 0) * cols;
+
+  constexpr int kVecElems = 16 / sizeof(IType);
+  const size_t num_vecs = cols / kVecElems;
+  float thread_amax = 0.0f;
+  if (active) {
+    for (size_t v = row_thread; v < num_vecs; v += kRowThreads) {
+      Vec<IType, kVecElems> vec;
+      vec.load_from(row_in + v * kVecElems);
+#pragma unroll
+      for (int e = 0; e < kVecElems; ++e) {
+        thread_amax = fmaxf(thread_amax, fabsf(static_cast<float>(vec.data.elt[e])));
+      }
+    }
+  }
+  float row_amax = warp_reduce_max_broadcast(thread_amax);
+  if constexpr (WARPS_PER_ROW > 1) {
+    __shared__ float row_amax_smem[kRowsPerBlock][WARPS_PER_ROW];
+    if (lane == 0) {
+      row_amax_smem[row_in_block][warp_in_row] = row_amax;
+    }
+    __syncthreads();
+    float combined = 0.0f;
+#pragma unroll
+    for (int w = 0; w < WARPS_PER_ROW; ++w) {
+      combined = fmaxf(combined, row_amax_smem[row_in_block][w]);
+    }
+    row_amax = combined;
+  }
+  if (active && row_thread == 0) {
+    amax_out[row] = row_amax;
+  }
+  if (!active) {
+    return;
+  }
+
+  const size_t num_groups = cols / kGroupSize;
+  for (size_t g = row_thread; g < num_groups; g += kRowThreads) {
+    const size_t col = g * kGroupSize;
+
+    Vec<IType, kElementsPerHalfGroup> x0_vec;
+    Vec<IType, kElementsPerHalfGroup> x1_vec;
+    x0_vec.load_from(row_in + col);
+    x1_vec.load_from(row_in + col + kElementsPerHalfGroup);
+
+    float x0[kElementsPerHalfGroup];
+    float x1[kElementsPerHalfGroup];
+    float block_amax = 0.0f;
+#pragma unroll
+    for (int i = 0; i < kElementsPerHalfGroup; ++i) {
+      const float v0 = static_cast<float>(x0_vec.data.elt[i]);
+      const float v1 = static_cast<float>(x1_vec.data.elt[i]);
+      x0[i] = v0;
+      x1[i] = v1;
+      block_amax = fmaxf(block_amax, fabsf(v0));
+      block_amax = fmaxf(block_amax, fabsf(v1));
+    }
+
+    const ScalePair scale_pair = compute_scale_pair<E4M3_MAX>(block_amax, row_amax);
+    CandidatePair candidates = make_candidates<Cfg, E4M3_MAX>(x0, x1, scale_pair, row_amax);
+    const bool pick_map4 = candidates.map4.err < candidates.map6.err;
+    scales[row * scale_stride + g] = select_scale(scale_pair, pick_map4);
+    store_packed_group(select_packed(candidates, pick_map4), &output[(row * cols + col) / 2]);
+  }
+#else
+  NVTE_DEVICE_ERROR("sm_100 or higher is required.");
+#endif
+}
+
+template <typename Cfg, int E4M3_MAX, typename IType>
+void launch_quantize_row_scaled_4over6(const Tensor &input, const Tensor *noop, Tensor *output,
+                                       cudaStream_t stream) {
+  const size_t rows = input.flat_first_dim();
+  const size_t cols = input.flat_last_dim();
+  if (rows == 0 || cols == 0) {
+    return;
+  }
+
+  const auto *input_ptr = reinterpret_cast<const IType *>(input.data.dptr);
+  auto *output_ptr = reinterpret_cast<fp4e2m1x2 *>(output->data.dptr);
+  auto *scales_ptr = reinterpret_cast<nvfp4_scale_t *>(output->scale_inv.dptr);
+  auto *amax_ptr = reinterpret_cast<float *>(output->amax.dptr);
+  const auto *noop_ptr = reinterpret_cast<const float *>(noop->data.dptr);
+  const size_t scale_stride = output->scale_inv.shape[1];
+
+  constexpr int kRowsPerBlock = kRowScaledFusedBlockWarps / kRowScaledFusedWarpsPerRow;
+  const dim3 grid(static_cast<unsigned int>(DIVUP(rows, static_cast<size_t>(kRowsPerBlock))));
+  const dim3 block(kRowScaledFusedThreads);
+  quantize_row_scaled_4over6_kernel<kRowScaledFusedWarpsPerRow, Cfg, E4M3_MAX, IType>
+      <<<grid, block, 0, stream>>>(input_ptr, output_ptr, scales_ptr, amax_ptr, rows, cols,
+                                   scale_stride, noop_ptr);
+}
+
 template <bool USE_2D_QUANTIZATION, typename Cfg, int E4M3_MAX, typename IType>
 void launch_quantize_4over6(const Tensor &input, const Tensor *noop, Tensor *output,
                             cudaStream_t stream) {
@@ -710,10 +841,22 @@ void quantize_4over6(const Tensor &input, const Tensor *noop, Tensor *output,
               quant_config->nvfp4_4over6_err_use_fast_math, ERR_USE_FAST_MATH, {
                 using Cfg = quantize_4over6_kernel::Config<MODE, ERR_USE_FAST_MATH>;
                 TRANSFORMER_ENGINE_TYPE_SWITCH_INPUT(
-                    input.dtype(), IType,
-                    quantize_4over6_kernel::launch_quantize_4over6<use_2d_quantization, Cfg,
-                                                                   E4M3_MAX, IType>(
-                        input, noop, output, stream););
+                    input.dtype(), IType, {
+                      if constexpr (!use_2d_quantization) {
+                        if (output->row_scaled_nvfp4 && use_fused_rowwise_amax_4over6()) {
+                          quantize_4over6_kernel::launch_quantize_row_scaled_4over6<
+                              Cfg, E4M3_MAX, IType>(input, noop, output, stream);
+                        } else {
+                          quantize_4over6_kernel::launch_quantize_4over6<use_2d_quantization, Cfg,
+                                                                         E4M3_MAX, IType>(
+                              input, noop, output, stream);
+                        }
+                      } else {
+                        quantize_4over6_kernel::launch_quantize_4over6<use_2d_quantization, Cfg,
+                                                                       E4M3_MAX, IType>(
+                            input, noop, output, stream);
+                      }
+                    });
               });););
 
   NVTE_CHECK_CUDA(cudaGetLastError());
